@@ -1,0 +1,10 @@
+[package]
+name = "v4l2-sys"
+version = "0.1.0"
+authors = ["Valentine Valyaeff <valentine.valyaeff@gmail.com>"]
+edition = "2021"
+license.workspace = true
+
+[build-dependencies]
+bindgen.workspace = true
+color-eyre.workspace = true

@@ -1,0 +1,13 @@
+[package]
+name = "orb-seekcamera"
+version = "0.0.0"
+edition = "2021"
+license.workspace = true
+
+[dependencies]
+log.workspace = true
+rkyv.workspace = true
+thiserror.workspace = true
+
+[dependencies.seekcamera-sys]
+path = "../seekcamera-sys"

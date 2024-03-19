@@ -1,0 +1,23 @@
+name: Test if Devcontainer is building on x86_64
+
+on:
+  pull_request:
+    paths:
+      - .devcontainers/**
+      - flake.nix
+      - flake.lock
+  push:
+    branches:
+      - master
+
+jobs:
+  test_build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out code
+        uses: actions/checkout@ee0669bd1cc54295c223e0bb666b733df41de1c5 # pin@v2
+      - name: Pre-build dev container image
+        uses: devcontainers/ci@57eaf0c9b518a76872bc429cdceefd65a912309b # pin@v0.3
+        env:
+          CACHIX_AUTH_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GIT_HUB_TOKEN }}

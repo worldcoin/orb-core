@@ -1,0 +1,17 @@
+[package]
+name = "orb-rgb-net"
+version = "0.1.0"
+authors = ["Dan Girshovich"]
+edition = "2021"
+license.workspace = true
+
+[dependencies]
+eyre.workspace = true
+log.workspace = true
+ndarray.workspace = true
+numpy.workspace = true
+pyo3.workspace = true
+
+[dev-dependencies]
+approx = "0.5.0"
+png = "0.16.8"

@@ -1,0 +1,10 @@
+[package]
+name = "wpa-supplicant-interface"
+version = "0.1.0"
+edition = "2021"
+description = "Restricted orb-core interface to wpa_supplicant"
+
+[dependencies]
+clap = { version = "3.2.22", features = ["derive"] }
+color-eyre.workspace = true
+eyre.workspace = true

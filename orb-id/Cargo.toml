@@ -1,0 +1,9 @@
+[package]
+name = "orb-id"
+version = "0.1.0"
+edition = "2021"
+description = "Interface to read the orb-id from the fusebanks"
+
+[dependencies]
+color-eyre.workspace = true
+eyre.workspace = true

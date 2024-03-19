@@ -1,0 +1,11 @@
+{
+    "configurations": [
+        {
+            "type": "lldb",
+            "request": "custom",
+            "name": "Debug orb-core",
+            "targetCreateCommands": ["target create ${workspaceFolder}/target/aarch64-unknown-linux-gnu/debug/orb-core"],
+            "processCreateCommands": ["gdb-remote 192.168.1.35:1234"]
+        }
+    ]
+}

@@ -1,0 +1,11 @@
+[package]
+name = "tmp-tracing"
+version = "0.0.0"
+edition.workspace = true
+publish = false
+license.workspace = true
+
+description = "Fake tracing crate, which just reexports log"
+
+[dependencies]
+log.workspace = true

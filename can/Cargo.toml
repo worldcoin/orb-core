@@ -1,0 +1,11 @@
+[package]
+name = "orb-can"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+
+[dependencies]
+libc = "0.2.109"
+log.workspace = true
+nix = { version = "0.26.2", default-features = false, features = ["net"] }
+thiserror = "1"

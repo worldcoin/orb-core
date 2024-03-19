@@ -1,0 +1,188 @@
+name: "CI"
+
+env:
+  GIT_CONFIG_KEY_0: url.https://${{ secrets.GIT_HUB_TOKEN }}:x-oauth-basic@github.com/worldcoin/.insteadOf
+  GIT_CONFIG_VALUE_0: https://github.com/worldcoin/
+  GIT_CONFIG_COUNT: 1
+  # I don't like this but it's mandatory, as GitHub actions have a git-lfs config in /etc/gitconfig
+  # that breaks nix git-lfs support. The following variable explicitly ignores the system config in
+  # /etc/gitconfig. Notice that this method will create issues if we start using git-lfs in orb-core.
+  GIT_CONFIG_NOSYSTEM: 1
+
+on:
+  pull_request:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - prod
+    tags:
+      - "*"
+
+jobs:
+  format:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@f43a0e5ff2bd294095638e18286ca9a3d1956744 # pin@v3
+        with:
+          token: ${{ secrets.GIT_HUB_TOKEN }}
+      - uses: cachix/install-nix-action@6ed004b9ccb68dbc28e7c85bee15fa93dbd214ac # pin@v22
+        with:
+          github_access_token: ${{ secrets.GIT_HUB_TOKEN }}
+      - uses: cachix/cachix-action@6a9a34cdd93d0ae4b4b59fd678660efb08109f2f # pin@v12
+        continue-on-error: true
+        with:
+          name: worldcoin
+          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+      - run: nix/cross.sh nix/ci.sh --server fmt
+
+  clippy:
+    runs-on: ubuntu-22.04-32core
+    steps:
+      - uses: actions/checkout@f43a0e5ff2bd294095638e18286ca9a3d1956744 # pin@v3
+        with:
+          token: ${{ secrets.GIT_HUB_TOKEN }}
+      - uses: cachix/install-nix-action@6ed004b9ccb68dbc28e7c85bee15fa93dbd214ac # pin@v22
+        with:
+          github_access_token: ${{ secrets.GIT_HUB_TOKEN }}
+      - uses: cachix/cachix-action@6a9a34cdd93d0ae4b4b59fd678660efb08109f2f # pin@v12
+        continue-on-error: true
+        with:
+          name: worldcoin
+          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+      - name: Generate git_version
+        run: |
+          git describe --always > git_version
+          git add git_version
+      - run: nix/cross.sh nix/ci.sh --server clippy
+
+  # check_debug_report_version:
+  #   runs-on: ubuntu-22.04-32core
+  #   environment: release
+  #   permissions:
+  #     id-token: write
+  #     contents: read
+  #   steps:
+  #     - uses: actions/checkout@f43a0e5ff2bd294095638e18286ca9a3d1956744 # pin@v3
+  #       with:
+  #         token: ${{ secrets.GIT_HUB_TOKEN }}
+  #     - uses: cachix/install-nix-action@6ed004b9ccb68dbc28e7c85bee15fa93dbd214ac # pin@v22
+  #       with:
+  #         github_access_token: ${{ secrets.GIT_HUB_TOKEN }}
+  #     - uses: cachix/cachix-action@6a9a34cdd93d0ae4b4b59fd678660efb08109f2f # pin@v12
+  #       continue-on-error: true
+  #       with:
+  #         name: worldcoin
+  #         authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+  #     - name: Configure AWS Credentials
+  #       uses: aws-actions/configure-aws-credentials@5fd3084fc36e372ff1fff382a39b10d03659f355 # pin@v2
+  #       with:
+  #         aws-region: eu-central-1
+  #         role-to-assume: ${{ secrets.INTERNAL_TOOLS_AWS_ROLE }}
+  #     - name: Check Signup Data Version and export schema
+  #       run: nix/native.sh nix/ci.sh --server check_debug_report_version
+  #     - name: Copy artifacts due to https://github.com/actions/upload-artifact/issues/92
+  #       run: cp -rL result artifacts
+  #     - name: Upload CSV & JSON files as artifacts
+  #       if: ${{ github.ref_name == 'main' || github.ref_name == 'prod' }}
+  #       uses: actions/upload-artifact@a8a3f3ad30e3422c9c7b888a15615d19a852ae32 # pin@v3
+  #       with:
+  #         name: debug-report-schema
+  #         path: |
+  #           artifacts/debug_report_schema.csv
+  #           artifacts/debug_report_schema.json
+
+  test:
+    runs-on: ubuntu-22.04-32core
+    steps:
+      - uses: actions/checkout@f43a0e5ff2bd294095638e18286ca9a3d1956744 # pin@v3
+        with:
+          token: ${{ secrets.GIT_HUB_TOKEN }}
+      - uses: cachix/install-nix-action@6ed004b9ccb68dbc28e7c85bee15fa93dbd214ac # pin@v22
+        with:
+          github_access_token: ${{ secrets.GIT_HUB_TOKEN }}
+      - uses: cachix/cachix-action@6a9a34cdd93d0ae4b4b59fd678660efb08109f2f # pin@v12
+        continue-on-error: true
+        with:
+          name: worldcoin
+          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+      - name: Generate git_version
+        run: |
+          git describe --always > git_version
+          git add git_version
+      - run: nix/native.sh nix/ci.sh --server test
+
+  doc:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@f43a0e5ff2bd294095638e18286ca9a3d1956744 # pin@v3
+        with:
+          token: ${{ secrets.GIT_HUB_TOKEN }}
+      - uses: cachix/install-nix-action@6ed004b9ccb68dbc28e7c85bee15fa93dbd214ac # pin@v22
+        with:
+          github_access_token: ${{ secrets.GIT_HUB_TOKEN }}
+      - uses: cachix/cachix-action@6a9a34cdd93d0ae4b4b59fd678660efb08109f2f # pin@v12
+        continue-on-error: true
+        with:
+          name: worldcoin
+          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+      - name: Generate git_version
+        run: |
+          git describe --always > git_version
+          git add git_version
+      - run: nix/native.sh nix/ci.sh --server doc
+
+  build:
+    if: ${{ github.ref_name == 'master' || github.ref_name == 'prod' || (github.ref_type == 'tag' && startsWith(github.ref_name, 'v')) }}
+    runs-on: ubuntu-22.04-32core
+    needs: [ format, clippy, test, doc, check_debug_report_version ]
+    steps:
+      - uses: actions/checkout@f43a0e5ff2bd294095638e18286ca9a3d1956744 # pin@v3
+        with:
+          token: ${{ secrets.GIT_HUB_TOKEN }}
+      - uses: cachix/install-nix-action@6ed004b9ccb68dbc28e7c85bee15fa93dbd214ac # pin@v22
+        with:
+          github_access_token: ${{ secrets.GIT_HUB_TOKEN }}
+      - uses: cachix/cachix-action@6a9a34cdd93d0ae4b4b59fd678660efb08109f2f # pin@v12
+        continue-on-error: true
+        with:
+          name: worldcoin
+          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+      - name: Generate git_version
+        run: |
+          git describe --always > git_version
+          git add git_version
+      - name: Build release binaries
+        run: nix/cross.sh nix/ci.sh --server build
+      - name: Archive artifacts due to https://github.com/actions/upload-artifact/issues/92
+        run: |
+          cp -rL result artifacts
+          tar -czvhf orb-core-artifacts.tar.gz artifacts
+      - uses: actions/upload-artifact@a8a3f3ad30e3422c9c7b888a15615d19a852ae32 # pin@v3
+        with:
+          name: orb-core-artifacts
+          path: artifacts
+      - name: Upload Release
+        uses: softprops/action-gh-release@de2c0eb89ae2a093876385947365aca7b0e5f844 # pin@v1
+        # only run this for release tags (e.g. v1.1.0)
+        if: ${{ github.ref_type == 'tag' && startsWith(github.ref_name, 'v') }}
+        with:
+          fail_on_unmatched_files: true
+          files: |
+            orb-core-artifacts.tar.gz
+      - name: Upload Development Build
+        # only run this for master branch
+        if: ${{ github.ref_name == 'master' }}
+        run: |
+          gh release delete latest \
+            --yes \
+            --cleanup-tag \
+            --repo ${{ github.repository }} || true
+          gh release create latest \
+            --title 'Development Build' \
+            --notes 'Latest successful build of master' \
+            --prerelease \
+            --repo ${{ github.repository }} \
+            orb-core-artifacts.tar.gz
+        env:
+          GH_TOKEN: ${{ github.token }}

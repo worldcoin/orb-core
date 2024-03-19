@@ -1,0 +1,5 @@
+/target
+!target/aarch64-unknown-linux-gnu/release/auto_mirror_calibration
+!target/aarch64-unknown-linux-gnu/release/manual_mirror_calibration
+!target/aarch64-unknown-linux-gnu/release/rgb_calibration
+!target/aarch64-unknown-linux-gnu/release/orb

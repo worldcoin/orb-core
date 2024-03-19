@@ -1,0 +1,11 @@
+/target
+/result
+.envrc
+.direnv
+.idea
+log/
+tmp/
+.DS_Store
+lcov.info
+/.devcontainer/postCreateCommand.user.sh
+/.vscode/launch.json

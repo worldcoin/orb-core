@@ -1,0 +1,15 @@
+[package]
+name = "orb-macros"
+version = "0.1.0"
+authors = ["Valentine Valyaeff <valentine.valyaeff@gmail.com>"]
+edition = "2021"
+license.workspace = true
+
+[lib]
+proc-macro = true
+
+[dependencies]
+Inflector = "0.11"
+proc-macro2 = "1"
+quote = "1"
+syn = "1"

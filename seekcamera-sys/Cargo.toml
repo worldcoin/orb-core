@@ -1,0 +1,9 @@
+[package]
+name = "seekcamera-sys"
+version = "0.0.0"
+edition = "2021"
+license.workspace = true
+
+[build-dependencies]
+bindgen.workspace = true
+color-eyre.workspace = true
