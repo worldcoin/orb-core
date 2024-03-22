@@ -135,7 +135,7 @@ jobs:
   build:
     if: ${{ github.ref_name == 'master' || github.ref_name == 'prod' || (github.ref_type == 'tag' && startsWith(github.ref_name, 'v')) }}
     runs-on: ubuntu-22.04-32core
-    needs: [ format, clippy, test, doc, check_debug_report_version ]
+    needs: [ format, clippy, test, doc ]
     steps:
       - uses: actions/checkout@f43a0e5ff2bd294095638e18286ca9a3d1956744 # pin@v3
         with:
