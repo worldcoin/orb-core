@@ -58,10 +58,7 @@ impl<'a, T, S: Stream<Item = Result<T, BroadcastStreamRecvError>> + Unpin + ?Siz
         loop {
             break match ready!(self.stream.poll_next_unpin(cx)) {
                 Some(Ok(output)) => Poll::Ready(Ok(output)),
-                Some(Err(BroadcastStreamRecvError::Lagged(count))) => {
-                    tracing::warn!("receiver lagged behind by {} items", count);
-                    continue;
-                }
+                Some(Err(BroadcastStreamRecvError::Lagged(_))) => continue,
                 None => Poll::Ready(Err(eyre!("broadcast channel closed unexpectedly"))),
             };
         }

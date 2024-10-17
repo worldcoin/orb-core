@@ -3,11 +3,9 @@
 use crate::{
     consts::{MAXIMUM_FAN_SPEED, MINIMUM_FAN_SPEED},
     pid::{InstantTimer, Pid, Timer},
-    port,
-    port::Port,
 };
-use async_trait::async_trait;
-use eyre::Result;
+use agentwire::port::{self, Port};
+use eyre::{Error, Result};
 use futures::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -185,13 +183,14 @@ impl Port for Agent {
     const OUTPUT_CAPACITY: usize = 0;
 }
 
-impl super::Agent for Agent {
+impl agentwire::Agent for Agent {
     const NAME: &'static str = "thermal";
 }
 
-#[async_trait]
-impl super::AgentTask for Agent {
-    async fn run(mut self, mut port: port::Inner<Self>) -> Result<()> {
+impl agentwire::agent::Task for Agent {
+    type Error = Error;
+
+    async fn run(mut self, mut port: port::Inner<Self>) -> Result<(), Self::Error> {
         // set default fan speed and temperature level on initialization
         port.send(port::Output::new(Output::FanSpeed(self.system_thermal_state.fan_speed))).await?;
         port.send(port::Output::new(Output::TemperatureLevel(

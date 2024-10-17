@@ -14,7 +14,7 @@
 //! assert_eq!(timestamped_frame[2], 3);
 //! ```
 
-use crate::serializable_instant::SerializableInstant;
+use crate::utils::serializable_instant::SerializableInstant;
 #[cfg(test)]
 use mock_instant::Instant;
 use schemars::JsonSchema;

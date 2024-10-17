@@ -1,22 +1,22 @@
 #![warn(unsafe_op_in_unsafe_fn)]
 #![warn(clippy::pedantic)]
 
+use agentwire::{port, BrokerFlow};
 use eyre::{bail, Result};
 use futures::{channel::mpsc, prelude::*};
 use orb::{
     agents::{camera, mirror},
     async_main,
-    backend::init_cert,
-    brokers::{BrokerFlow, Orb, OrbPlan},
+    brokers::{Orb, OrbPlan},
     calibration::Calibration,
     config::Config,
-    consts::{IR_CAMERA_FRAME_RATE, RGB_REDUCED_HEIGHT, RGB_REDUCED_WIDTH},
+    consts::{
+        CALIBRATION_FILE_PATH, IR_CAMERA_FRAME_RATE, RGB_FPS, RGB_REDUCED_HEIGHT, RGB_REDUCED_WIDTH,
+    },
     ext::mpsc::SenderExt as _,
-    led::{self, Engine},
-    mcu::{self, Mcu},
-    monitor::{self, cpu::Monitor as _},
+    mcu, monitor,
     plans::biometric_capture::{IR_TARGET_MEAN, MIN_SHARPNESS},
-    port, sound,
+    ui::{self, Engine},
 };
 use std::{
     io::{prelude::*, stdin, stdout, Stdout},
@@ -70,12 +70,15 @@ impl Plan {
         orb.main_mcu.send(mcu::main::Input::FrameRate(IR_CAMERA_FRAME_RATE)).await?;
         orb.disable_ir_led().await?;
         orb.main_mcu.send(mcu::main::Input::LiquidLens(None)).await?;
+        #[cfg(feature = "livestream")]
+        orb.enable_livestream()?;
         orb.enable_ir_net().await?;
         orb.enable_rgb_net(true).await?;
         orb.start_ir_eye_camera().await?;
         orb.start_ir_face_camera().await?;
-        orb.start_rgb_camera().await?;
+        orb.start_rgb_camera(RGB_FPS).await?;
         orb.start_thermal_camera().await?;
+        orb.start_depth_camera().await?;
         orb.start_ir_auto_exposure(IR_TARGET_MEAN).await?;
         orb.start_ir_auto_focus(MIN_SHARPNESS, false).await?;
         orb.enable_eye_tracker()?;
@@ -123,19 +126,22 @@ impl Plan {
         orb.stop_eye_tracker().await?;
         if orb.eye_pid_controller.is_enabled() {
             if let Some(mirror_offset) = orb.stop_eye_pid_controller().await? {
-                calibration.mirror.horizontal_offset += mirror_offset.horizontal;
-                calibration.mirror.vertical_offset += mirror_offset.vertical;
+                calibration.mirror.phi_offset_degrees += mirror_offset.phi_degrees;
+                calibration.mirror.theta_offset_degrees += mirror_offset.theta_degrees;
             }
         }
         orb.stop_ir_auto_focus().await?;
+        #[cfg(feature = "livestream")]
+        orb.disable_livestream();
         if orb.thermal_camera.is_enabled() {
             orb.stop_thermal_camera().await?;
         }
+        orb.stop_depth_camera().await?;
         orb.stop_rgb_camera().await?;
         orb.stop_ir_face_camera().await?;
         orb.stop_ir_eye_camera().await?;
         orb.disable_agents();
-        calibration.store().await?;
+        calibration.store(CALIBRATION_FILE_PATH).await?;
         Ok(())
     }
 }
@@ -196,19 +202,19 @@ fn spawn_command_thread(mut command_tx: mpsc::Sender<Command>, mut calibration: 
                     command_tx.send_now(Command::ThermalCameraCalibrate).unwrap();
                 }
                 Key::Left => {
-                    calibration.mirror.horizontal_offset += 0.05;
+                    calibration.mirror.phi_offset_degrees -= 0.1;
                     recalibrate(&stdout, &mut command_tx, &calibration);
                 }
                 Key::Right => {
-                    calibration.mirror.horizontal_offset -= 0.05;
+                    calibration.mirror.phi_offset_degrees += 0.1;
                     recalibrate(&stdout, &mut command_tx, &calibration);
                 }
                 Key::Up => {
-                    calibration.mirror.vertical_offset -= 0.05;
+                    calibration.mirror.theta_offset_degrees -= 0.1;
                     recalibrate(&stdout, &mut command_tx, &calibration);
                 }
                 Key::Down => {
-                    calibration.mirror.vertical_offset += 0.05;
+                    calibration.mirror.theta_offset_degrees += 0.1;
                     recalibrate(&stdout, &mut command_tx, &calibration);
                 }
                 _ => {}
@@ -224,21 +230,19 @@ fn main() -> Result<()> {
 }
 
 async fn run() -> Result<()> {
-    init_cert().unwrap();
+    let ui = ui::Jetson::spawn();
     let config = Arc::new(Mutex::new(Config::load_or_default().await));
+    config.lock().await.propagate_to_ui(&ui);
     let cpu_monitor = Box::new(monitor::cpu::Jetson::spawn());
-    let sound = sound::Jetson::spawn(Arc::clone(&config), true, cpu_monitor.clone()).await?;
     let main_mcu = mcu::main::Jetson::spawn()?;
     let net_monitor = monitor::net::Jetson::spawn(Arc::clone(&config))?;
-    let led = led::Jetson::spawn(main_mcu.clone());
-    led.pause();
+    ui.pause();
     orb::short_lived_token::wait_for_token().await;
     Config::download_and_store(Arc::clone(&config)).await?;
     let mut orb = Box::pin(
         Orb::builder()
             .config(config)
-            .sound(Box::new(sound))
-            .led(Box::new(led))
+            .ui(Box::new(ui))
             .main_mcu(Box::new(main_mcu))
             .net_monitor(Box::new(net_monitor))
             .cpu_monitor(cpu_monitor)

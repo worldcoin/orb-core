@@ -1,7 +1,9 @@
-use super::{AgentCell, BrokerFlow};
+use super::process_logger;
+#[cfg(feature = "livestream")]
+use crate::agents::livestream;
 use crate::{
     agents::{
-        camera, distance, eye_pid_controller, eye_tracker, image_notary, image_uploader,
+        camera, data_uploader, distance, eye_pid_controller, eye_tracker, image_notary,
         ir_auto_exposure, ir_auto_focus, mirror,
         python::{
             face_identifier, ir_net, mega_agent_one,
@@ -13,36 +15,40 @@ use crate::{
     calibration::Calibration,
     config::Config,
     consts::{
-        DBUS_SIGNUP_OBJECT_PATH, DBUS_WELL_KNOWN_BUS_NAME, DEFAULT_IR_LED_DURATION,
-        DEFAULT_IR_LED_WAVELENGTH, GRACEFUL_SHUTDOWN_MAX_DELAY_SECONDS, IR_CAMERA_FRAME_RATE,
+        CALIBRATION_FILE_PATH, DBUS_SIGNUP_OBJECT_PATH, DBUS_WELL_KNOWN_BUS_NAME,
+        DEFAULT_IR_LED_DURATION, DEFAULT_IR_LED_WAVELENGTH, IR_CAMERA_FRAME_RATE,
         IR_LED_MAX_DURATION, IR_LED_MAX_DURATION_740NM, IR_LED_MIN_DURATION,
+        MIRROR_PHI_MAX_DIAMOND, MIRROR_PHI_MAX_PEARL, MIRROR_PHI_MIN_DIAMOND, MIRROR_PHI_MIN_PEARL,
+        MIRROR_THETA_MAX_DIAMOND, MIRROR_THETA_MAX_PEARL, MIRROR_THETA_MIN_DIAMOND,
+        MIRROR_THETA_MIN_PEARL,
     },
-    dbus::SupervisorProxy,
     ext::mpsc::SenderExt as _,
-    fisheye, led,
-    logger::{DATADOG, NO_TAGS},
-    mcu,
-    mcu::{main::IrLed, Mcu},
+    identification,
+    image::fisheye,
+    mcu::{self, main::IrLed, Mcu},
     monitor,
     plans::biometric_capture::{EyeCapture, SelfCustodyCandidate},
-    port, sound,
-    sound::Melody,
+    ui,
 };
-use eyre::{bail, Result, WrapErr};
-use futures::{channel::mpsc, prelude::*};
-use nix::unistd::sync;
-use orb_macros::Broker;
+use agentwire::{agent, port, Broker, BrokerFlow};
+use eyre::{bail, Error, Result};
+use futures::{channel::mpsc, future::BoxFuture, prelude::*};
 use orb_wld_data_id::SignupId;
 use std::{
     collections::VecDeque,
-    convert::Infallible,
     ops::RangeInclusive,
-    process,
     sync::Arc,
     task::{Context, Poll},
     time::{Duration, Instant},
 };
-use tokio::{sync::Mutex, time::sleep};
+use tokio::{
+    process::{ChildStderr, ChildStdout},
+    sync::Mutex,
+    time::sleep,
+};
+
+#[cfg(feature = "internal-data-acquisition")]
+use crate::agents::image_uploader;
 
 // Give the IR camera enough time to fetch the last frame before external_trigger stops.
 // Give it time to take 1-2 frames.
@@ -88,6 +94,14 @@ pub trait Plan {
         &mut self,
         _orb: &mut Orb,
         _output: port::Output<camera::thermal::Sensor>,
+    ) -> Result<BrokerFlow> {
+        Ok(BrokerFlow::Continue)
+    }
+
+    fn handle_depth_camera(
+        &mut self,
+        _orb: &mut Orb,
+        _output: port::Output<camera::depth::Sensor>,
     ) -> Result<BrokerFlow> {
         Ok(BrokerFlow::Continue)
     }
@@ -151,6 +165,14 @@ pub trait Plan {
         Ok(BrokerFlow::Continue)
     }
 
+    fn handle_distance(
+        &mut self,
+        _orb: &mut Orb,
+        _output: port::Output<distance::Agent>,
+    ) -> Result<BrokerFlow> {
+        Ok(BrokerFlow::Continue)
+    }
+
     fn poll_extra(&mut self, _orb: &mut Orb, _cx: &mut Context<'_>) -> Result<BrokerFlow> {
         Ok(BrokerFlow::Continue)
     }
@@ -159,44 +181,53 @@ pub trait Plan {
 /// The main Orb broker.
 #[allow(missing_docs, clippy::struct_excessive_bools)]
 #[derive(Broker)]
+#[broker(plan = Plan, error = Error, poll_extra)]
 pub struct Orb {
+    #[agent(thread, init)]
+    pub ir_eye_camera: agent::Cell<camera::ir::Sensor>,
+    #[agent(thread, init)]
+    pub ir_face_camera: agent::Cell<camera::ir::Sensor>,
+    #[agent(task, init)]
+    pub rgb_camera: agent::Cell<camera::rgb::Sensor>,
+    #[agent(process, init_async, logger = self.process_logger().await)]
+    pub thermal_camera: agent::Cell<camera::thermal::Sensor>,
     #[agent(thread)]
-    pub ir_eye_camera: AgentCell<camera::ir::Sensor>,
+    pub depth_camera: agent::Cell<camera::depth::Sensor>,
+    #[agent(process, init_async, logger = self.process_logger().await)]
+    pub mega_agent_one: agent::Cell<mega_agent_one::MegaAgentOne>,
+    #[agent(process, init_async, logger = self.process_logger().await)]
+    pub mega_agent_two: agent::Cell<mega_agent_two::MegaAgentTwo>,
+    #[agent(task)]
+    pub ir_auto_focus: agent::Cell<ir_auto_focus::Agent>,
+    #[agent(task)]
+    pub ir_auto_exposure: agent::Cell<ir_auto_exposure::Agent>,
     #[agent(thread)]
-    pub ir_face_camera: AgentCell<camera::ir::Sensor>,
+    pub eye_tracker: agent::Cell<eye_tracker::Agent>,
     #[agent(task)]
-    pub rgb_camera: AgentCell<camera::rgb::Sensor>,
-    #[agent(async, process)]
-    pub thermal_camera: AgentCell<camera::thermal::Sensor>,
-    #[agent(async, process)]
-    pub mega_agent_one: AgentCell<mega_agent_one::MegaAgentOne>,
-    #[agent(async, process)]
-    pub mega_agent_two: AgentCell<mega_agent_two::MegaAgentTwo>,
-    #[agent(default, task)]
-    pub ir_auto_focus: AgentCell<ir_auto_focus::Agent>,
-    #[agent(default, task)]
-    pub ir_auto_exposure: AgentCell<ir_auto_exposure::Agent>,
-    #[agent(default, thread)]
-    pub eye_tracker: AgentCell<eye_tracker::Agent>,
-    #[agent(default, task)]
-    pub eye_pid_controller: AgentCell<eye_pid_controller::Agent>,
+    pub eye_pid_controller: agent::Cell<eye_pid_controller::Agent>,
+    #[agent(task, init)]
+    pub mirror: agent::Cell<mirror::Actuator>,
+    #[agent(task, init)]
+    pub distance: agent::Cell<distance::Agent>,
+    #[agent(process, init_async, logger = self.process_logger().await)]
+    pub qr_code: agent::Cell<qr_code::Agent>,
+    #[cfg(feature = "internal-data-acquisition")]
     #[agent(task)]
-    pub mirror: AgentCell<mirror::Actuator>,
-    #[agent(task)]
-    pub distance: AgentCell<distance::Agent>,
-    #[agent(default, process)]
-    pub qr_code: AgentCell<qr_code::Agent>,
-    #[agent(default, task)]
-    pub image_uploader: AgentCell<image_uploader::Agent>,
-    #[agent(default, thread)]
-    pub image_notary: AgentCell<image_notary::Agent>,
+    pub image_uploader: agent::Cell<image_uploader::Agent>,
+    #[agent(task, init)]
+    pub data_uploader: agent::Cell<data_uploader::Agent>,
+    #[agent(thread)]
+    pub image_notary: agent::Cell<image_notary::Agent>,
+    #[cfg(feature = "livestream")]
+    #[agent(thread)]
+    pub livestream: agent::Cell<livestream::Agent>,
 
     pub config: Arc<Mutex<Config>>,
-    pub sound: Box<dyn sound::Player>,
-    pub led: Box<dyn led::Engine>,
+    pub ui: Box<dyn ui::Engine>,
     pub main_mcu: Box<dyn Mcu<mcu::Main>>,
     pub net_monitor: Box<dyn monitor::net::Monitor>,
     pub cpu_monitor: Box<dyn monitor::cpu::Monitor>,
+    pub orb_relay: Option<orb_relay_client::client::Client>,
     pub dbus_conn: Option<zbus::Connection>,
     pub state_rx: Option<StateRx>,
     pub focus_matrix_code: bool,
@@ -205,7 +236,6 @@ pub struct Orb {
     pub thermal_save_fps_override: Option<f32>,
     pub mirror_point: Option<mirror::Point>,
     pub mirror_offset: Option<mirror::Point>,
-    pub trigger_shutdown_idle: bool,
     /// Used to control if RGB camera should forward frames to the RGB-Net model exclusively, so to some other models
     /// too. e.g. the Face Identifier model.
     pub only_rgb_net_frames: bool,
@@ -227,8 +257,7 @@ pub struct Orb {
 #[derive(Default)]
 pub struct Builder {
     config: Option<Arc<Mutex<Config>>>,
-    sound: Option<Box<dyn sound::Player>>,
-    led: Option<Box<dyn led::Engine>>,
+    ui: Option<Box<dyn ui::Engine>>,
     main_mcu: Option<Box<dyn Mcu<mcu::Main>>>,
     net_monitor: Option<Box<dyn monitor::net::Monitor>>,
     cpu_monitor: Option<Box<dyn monitor::cpu::Monitor>>,
@@ -269,15 +298,19 @@ impl Builder {
     pub async fn build(self) -> Result<Orb> {
         let Self {
             config,
-            sound,
-            led,
+            ui,
             main_mcu,
             net_monitor,
             cpu_monitor,
             enable_state_rx,
             rgb_camera_fake_port,
         } = self;
-        let calibration = Calibration::load_or_default().await;
+        let config = config.unwrap_or_default();
+        let calibration = if let Ok(calibration) = Calibration::load(CALIBRATION_FILE_PATH).await {
+            calibration
+        } else {
+            (&*config.lock().await).into()
+        };
         let (state_tx, state_rx) = if enable_state_rx {
             let (ir_eye_camera_state_tx, ir_eye_camera_state_rx) = mpsc::channel(1);
             let (ir_face_camera_state_tx, ir_face_camera_state_rx) = mpsc::channel(1);
@@ -305,17 +338,16 @@ impl Builder {
                 );
             })
             .ok();
-        let config = config.unwrap_or_default();
         let ir_eye_save_fps_override = config.lock().await.ir_eye_save_fps_override;
         let ir_face_save_fps_override = config.lock().await.ir_face_save_fps_override;
         let thermal_save_fps_override = config.lock().await.thermal_save_fps_override;
         Ok(new_orb!(
             config,
-            sound: sound.unwrap_or_else(|| Box::new(sound::Fake)),
-            led: led.unwrap_or_else(|| Box::new(led::Fake)),
+            ui: ui.unwrap_or_else(|| Box::new(ui::Fake)),
             main_mcu: main_mcu.unwrap_or_else(|| Box::<mcu::main::Fake>::default()),
             net_monitor: net_monitor.unwrap_or_else(|| Box::new(monitor::net::Fake)),
             cpu_monitor: cpu_monitor.unwrap_or_else(|| Box::new(monitor::cpu::Fake)),
+            orb_relay: None,
             dbus_conn,
             calibration,
             target_left_eye: false,
@@ -325,7 +357,6 @@ impl Builder {
             thermal_save_fps_override,
             mirror_point: None,
             mirror_offset: None,
-            trigger_shutdown_idle: false,
             only_rgb_net_frames: true,
             ir_net_enabled: false,
             ir_net_frames: VecDeque::new(),
@@ -347,17 +378,10 @@ impl Builder {
         self
     }
 
-    /// Sets the sound player.
+    /// Sets the UI engine.
     #[must_use]
-    pub fn sound(mut self, sound: Box<dyn sound::Player>) -> Self {
-        self.sound = Some(sound);
-        self
-    }
-
-    /// Sets the LED engine.
-    #[must_use]
-    pub fn led(mut self, led: Box<dyn led::Engine>) -> Self {
-        self.led = Some(led);
+    pub fn ui(mut self, ui: Box<dyn ui::Engine>) -> Self {
+        self.ui = Some(ui);
         self
     }
 
@@ -471,6 +495,12 @@ impl Orb {
     /// right eye otherwise.
     pub async fn set_target_left_eye(&mut self, target_left_eye: bool) -> Result<()> {
         self.target_left_eye = target_left_eye;
+        #[cfg(feature = "livestream")]
+        if let Some(livestream) = self.livestream.enabled() {
+            livestream
+                .send(port::Input::new(livestream::Input::TargetLeftEye(self.target_left_eye)))
+                .await?;
+        }
         if let Some(eye_pid_controller) = self.eye_pid_controller.enabled() {
             eye_pid_controller
                 .send_unjam(port::Input::new(eye_pid_controller::Input::SwitchEye))
@@ -488,15 +518,20 @@ impl Orb {
     /// Updates the mirror calibration.
     pub async fn recalibrate(&mut self, calibration: Calibration) -> Result<()> {
         self.calibration = calibration;
-        self.mirror
+        Ok(self
+            .mirror
             .enabled()
             .unwrap()
             .send_unjam(port::Input::new(mirror::Command::Recalibrate(self.calibration.clone())))
-            .await
+            .await?)
     }
 
     /// Starts eye IR camera.
     pub async fn start_ir_eye_camera(&mut self) -> Result<()> {
+        #[cfg(feature = "livestream")]
+        if let Some(livestream) = self.livestream.enabled() {
+            livestream.send(port::Input::new(livestream::Input::IrEyeState(true))).await?;
+        }
         self.main_mcu.send(mcu::main::Input::TriggeringIrEyeCamera(true)).await?;
         self.main_mcu.send(mcu::main::Input::FrameRate(IR_CAMERA_FRAME_RATE)).await?;
         self.enable_ir_eye_camera()?;
@@ -515,8 +550,13 @@ impl Orb {
     ///
     /// If the camera agent is not enabled.
     pub async fn stop_ir_eye_camera(&mut self) -> Result<camera::ir::Log> {
+        #[cfg(feature = "livestream")]
+        if let Some(livestream) = self.livestream.enabled() {
+            livestream.send(port::Input::new(livestream::Input::IrEyeState(false))).await?;
+        }
         let log =
-            self.ir_eye_camera.enabled().expect("ir_eye_camera is not enabled").stop().await?;
+            camera::ir::stop(self.ir_eye_camera.enabled().expect("ir_eye_camera is not enabled"))
+                .await?;
         self.disable_ir_eye_camera();
         sleep(IR_CAMERA_STOP_DELAY).await;
         if !self.ir_face_camera.is_enabled() {
@@ -528,6 +568,10 @@ impl Orb {
 
     /// Starts face IR camera.
     pub async fn start_ir_face_camera(&mut self) -> Result<()> {
+        #[cfg(feature = "livestream")]
+        if let Some(livestream) = self.livestream.enabled() {
+            livestream.send(port::Input::new(livestream::Input::IrFaceState(true))).await?;
+        }
         self.main_mcu.send(mcu::main::Input::TriggeringIrFaceCamera(true)).await?;
         self.main_mcu.send(mcu::main::Input::FrameRate(IR_CAMERA_FRAME_RATE)).await?;
         self.enable_ir_face_camera()?;
@@ -546,8 +590,13 @@ impl Orb {
     ///
     /// If the camera agent is not enabled.
     pub async fn stop_ir_face_camera(&mut self) -> Result<camera::ir::Log> {
+        #[cfg(feature = "livestream")]
+        if let Some(livestream) = self.livestream.enabled() {
+            livestream.send(port::Input::new(livestream::Input::IrFaceState(false))).await?;
+        }
         let log =
-            self.ir_face_camera.enabled().expect("ir_face_camera is not enabled").stop().await?;
+            camera::ir::stop(self.ir_face_camera.enabled().expect("ir_face_camera is not enabled"))
+                .await?;
         self.disable_ir_face_camera();
         sleep(IR_CAMERA_STOP_DELAY).await;
         if !self.ir_eye_camera.is_enabled() {
@@ -573,13 +622,17 @@ impl Orb {
     }
 
     /// Starts RGB camera.
-    pub async fn start_rgb_camera(&mut self) -> Result<()> {
+    pub async fn start_rgb_camera(&mut self, fps: u32) -> Result<()> {
+        #[cfg(feature = "livestream")]
+        if let Some(livestream) = self.livestream.enabled() {
+            livestream.send(port::Input::new(livestream::Input::RgbState(true))).await?;
+        }
         self.only_rgb_net_frames = true;
         self.enable_rgb_camera()?;
         self.rgb_camera
             .enabled()
             .unwrap()
-            .send(port::Input::new(camera::rgb::Command::Start))
+            .send(port::Input::new(camera::rgb::Command::Start { fps }))
             .await?;
         Ok(())
     }
@@ -590,6 +643,10 @@ impl Orb {
     ///
     /// If the camera agent is not enabled.
     pub async fn stop_rgb_camera(&mut self) -> Result<()> {
+        #[cfg(feature = "livestream")]
+        if let Some(livestream) = self.livestream.enabled() {
+            livestream.send(port::Input::new(livestream::Input::RgbState(false))).await?;
+        }
         self.rgb_camera
             .enabled()
             .expect("rgb_camera is not enabled")
@@ -605,6 +662,10 @@ impl Orb {
     ///
     /// If the camera agent is not enabled
     pub async fn start_thermal_camera(&mut self) -> Result<()> {
+        #[cfg(feature = "livestream")]
+        if let Some(livestream) = self.livestream.enabled() {
+            livestream.send(port::Input::new(livestream::Input::ThermalState(true))).await?;
+        }
         self.enable_thermal_camera().await?;
         self.thermal_camera
             .enabled()
@@ -620,12 +681,54 @@ impl Orb {
     ///
     /// If the camera agent is not enabled
     pub async fn stop_thermal_camera(&mut self) -> Result<()> {
+        #[cfg(feature = "livestream")]
+        if let Some(livestream) = self.livestream.enabled() {
+            livestream.send(port::Input::new(livestream::Input::ThermalState(false))).await?;
+        }
         self.thermal_camera
             .enabled()
             .expect("thermal camera is not enabled")
             .send(port::Input::new(camera::thermal::Command::Stop))
             .await?;
         self.disable_thermal_camera();
+        Ok(())
+    }
+
+    /// Starts the depth camera
+    ///
+    /// # Panics
+    ///
+    /// If the camera agent is not enabled
+    pub async fn start_depth_camera(&mut self) -> Result<()> {
+        #[cfg(feature = "livestream")]
+        if let Some(livestream) = self.livestream.enabled() {
+            livestream.send(port::Input::new(livestream::Input::DepthState(true))).await?;
+        }
+        self.enable_depth_camera()?;
+        self.depth_camera
+            .enabled()
+            .unwrap()
+            .send(port::Input::new(camera::depth::Command::Start))
+            .await?;
+        Ok(())
+    }
+
+    /// Stops the depth camera
+    ///
+    /// # Panics
+    ///
+    /// If the camera agent is not enabled
+    pub async fn stop_depth_camera(&mut self) -> Result<()> {
+        #[cfg(feature = "livestream")]
+        if let Some(livestream) = self.livestream.enabled() {
+            livestream.send(port::Input::new(livestream::Input::DepthState(false))).await?;
+        }
+        self.depth_camera
+            .enabled()
+            .expect("depth camera is not enabled")
+            .send(port::Input::new(camera::depth::Command::Stop))
+            .await?;
+        self.disable_depth_camera();
         Ok(())
     }
 
@@ -648,14 +751,11 @@ impl Orb {
     /// # Panics
     ///
     /// If the agent is not enabled.
-    pub async fn stop_distance(&mut self) -> Result<()> {
-        self.distance
-            .enabled()
-            .expect("distance is not enabled")
-            .send_unjam(port::Input::new(distance::Input::Reset))
-            .await?;
+    pub async fn stop_distance(&mut self) -> Result<distance::Log> {
+        let log =
+            distance::reset(self.distance.enabled().expect("distance is not enabled")).await?;
         self.disable_distance();
-        Ok(())
+        Ok(log)
     }
 
     /// Starts IR auto-focus agent.
@@ -675,12 +775,12 @@ impl Orb {
     }
 
     /// Initializes the image_notary agent with the given `signup_id`.
-    pub async fn start_image_notary(&mut self, signup_id: SignupId, is_opt_in: bool) -> Result<()> {
+    pub async fn start_image_notary(&mut self, signup_id: SignupId) -> Result<()> {
         self.enable_image_notary()?;
         self.image_notary
             .enabled()
             .unwrap()
-            .send(port::Input::new(image_notary::Input::InitializeSignup { signup_id, is_opt_in }))
+            .send(port::Input::new(image_notary::Input::InitializeSignup { signup_id }))
             .await?;
         Ok(())
     }
@@ -737,32 +837,45 @@ impl Orb {
     ///
     /// If the agent is not enabled.
     pub async fn stop_mirror(&mut self) -> Result<mirror::Log> {
-        let mirror_log = self.mirror.enabled().expect("mirror is not enabled").take_log().await?;
+        let mirror_log =
+            mirror::take_log(self.mirror.enabled().expect("mirror is not enabled")).await?;
         self.disable_mirror();
         Ok(mirror_log)
     }
 
-    /// Stops the image saver agent.
+    /// Saves identification images.
     ///
     /// # Panics
     ///
     /// If the agent is not enabled.
-    pub async fn stop_image_notary(
+    pub async fn save_identification_images(
         &mut self,
-        eyes: Option<(EyeCapture, EyeCapture, SelfCustodyCandidate)>,
-    ) -> Result<(image_notary::Log, Option<image_notary::IdentificationImages>)> {
+        left: EyeCapture,
+        right: EyeCapture,
+        self_custody_candidate: SelfCustodyCandidate,
+    ) -> Result<image_notary::IdentificationImages> {
+        let image_notary = self.image_notary.enabled().expect("image_notary is not enabled");
+        Ok(image_notary::save_identification_images(
+            image_notary,
+            left,
+            right,
+            self_custody_candidate,
+        )
+        .await?
+        .unwrap_or_default())
+    }
+
+    /// Stops the image notary agent.
+    ///
+    /// # Panics
+    ///
+    /// If the agent is not enabled.
+    pub async fn stop_image_notary(&mut self) -> Result<image_notary::Log> {
         let image_notary = self.image_notary.enabled().expect("image_notary is not enabled");
         image_notary.send(port::Input::new(image_notary::Input::FinalizeSignup)).await?;
-        let mut identification_images = None;
-        if let Some((left, right, self_custody_candidate)) = eyes {
-            identification_images = image_notary
-                .save_identification_images(left, right, self_custody_candidate)
-                .await
-                .unwrap_or_default();
-        }
-        let image_notary_log = image_notary.take_log().await?;
+        let image_notary_log = image_notary::take_log(image_notary).await?;
         self.disable_image_notary();
-        Ok((image_notary_log, identification_images))
+        Ok(image_notary_log)
     }
 
     /// Enables IR-Net model.
@@ -826,6 +939,19 @@ impl Orb {
                 .await?;
         }
         Ok(())
+    }
+
+    /// Sets the current phase name.
+    #[cfg_attr(not(feature = "livestream"), allow(clippy::unused_async))]
+    pub async fn set_phase(&mut self, name: &'static str) {
+        tracing::info!("PHASE: {name}");
+        #[cfg(feature = "livestream")]
+        if let Some(livestream) = self.livestream.enabled() {
+            livestream
+                .send(port::Input::new(livestream::Input::Phase(name)))
+                .await
+                .expect("to always be able to send");
+        }
     }
 
     fn send_ir_net_estimate(&mut self, input: ir_net::Input) -> Result<()> {
@@ -902,7 +1028,16 @@ impl Orb {
     }
 
     fn init_distance(&mut self) -> distance::Agent {
-        distance::Agent { sound: self.sound.clone(), led: self.led.clone() }
+        distance::Agent { ui: self.ui.clone() }
+    }
+
+    #[allow(clippy::unused_async)]
+    async fn init_qr_code(&mut self) -> Result<qr_code::Agent> {
+        Ok(qr_code::Agent {})
+    }
+
+    fn init_data_uploader(&mut self) -> data_uploader::Agent {
+        data_uploader::Agent { config: Arc::clone(&self.config) }
     }
 
     fn handle_ir_eye_camera(
@@ -910,8 +1045,15 @@ impl Orb {
         plan: &mut dyn Plan,
         output: port::Output<camera::ir::Sensor>,
     ) -> Result<BrokerFlow> {
+        #[cfg(feature = "livestream")]
+        if let Some(livestream) = self.livestream.enabled() {
+            livestream
+                .tx
+                .send_now(output.chain(livestream::Input::IrEyeFrame(output.value.clone())))?;
+        }
         if let Some(ir_auto_exposure) = self.ir_auto_exposure.enabled() {
             ir_auto_exposure
+                .tx
                 .send_now(output.chain(ir_auto_exposure::Input::Frame(output.value.clone())))?;
         }
         if self.is_ir_net_enabled() {
@@ -924,20 +1066,21 @@ impl Orb {
             if let Some(ir_auto_focus) = self.ir_auto_focus.enabled() {
                 // forward frame to IR auto focus if IR net is not enabled for internal sharpness calculation.
                 ir_auto_focus
+                    .tx
                     .send_now(output.chain(ir_auto_focus::Input::Frame(output.value.clone())))?;
             }
             if let Some(image_notary) = self.image_notary.enabled() {
                 // Timestamps are generated in the image_notary history, so send there first.
-                image_notary.send_now(port::Input::new(image_notary::Input::SaveIrNetEstimate(
-                    image_notary::SaveIrNetEstimateInput {
+                image_notary.tx.send_now(port::Input::new(
+                    image_notary::Input::SaveIrNetEstimate(image_notary::SaveIrNetEstimateInput {
                         estimate: None,
                         frame: output.value.clone(),
                         wavelength: self.ir_led_wavelength,
                         target_left_eye: self.target_left_eye,
                         fps_override: self.ir_eye_save_fps_override,
                         log_metadata_always: true,
-                    },
-                )))?;
+                    }),
+                ))?;
             }
         }
         plan.handle_ir_eye_camera(self, output)
@@ -948,8 +1091,14 @@ impl Orb {
         plan: &mut dyn Plan,
         output: port::Output<camera::ir::Sensor>,
     ) -> Result<BrokerFlow> {
+        #[cfg(feature = "livestream")]
+        if let Some(livestream) = self.livestream.enabled() {
+            livestream
+                .tx
+                .send_now(output.chain(livestream::Input::IrFaceFrame(output.value.clone())))?;
+        }
         if let Some(image_notary) = self.image_notary.enabled() {
-            image_notary.send_now(port::Input::new(image_notary::Input::SaveIrFaceData(
+            image_notary.tx.send_now(port::Input::new(image_notary::Input::SaveIrFaceData(
                 image_notary::SaveIrFaceDataInput {
                     frame: output.value.clone(),
                     wavelength: self.ir_led_wavelength,
@@ -966,8 +1115,14 @@ impl Orb {
         plan: &mut dyn Plan,
         output: port::Output<camera::rgb::Sensor>,
     ) -> Result<BrokerFlow> {
+        #[cfg(feature = "livestream")]
+        if let Some(livestream) = self.livestream.enabled() {
+            livestream
+                .tx
+                .send_now(output.chain(livestream::Input::RgbFrame(output.value.clone())))?;
+        }
         if let Some(qr_code) = self.qr_code.enabled() {
-            qr_code.send_now(output.chain(qr_code::Input::Frame(output.value.clone())))?;
+            qr_code.tx.send_now(output.chain(qr_code::Input::Frame(output.value.clone())))?;
         }
         if self.is_rgb_net_enabled() {
             if self.only_rgb_net_frames {
@@ -984,18 +1139,26 @@ impl Orb {
         output: &port::Output<T>,
         estimate: &rgb_net::EstimateOutput,
     ) -> Result<()> {
+        #[cfg(feature = "livestream")]
+        if let Some(livestream) = self.livestream.enabled() {
+            livestream
+                .tx
+                .send_now(output.chain(livestream::Input::RgbNetEstimate(estimate.clone())))?;
+        }
         if let Some(eye_tracker) = self.eye_tracker.enabled() {
             if let Some(input) = eye_tracker::Input::track(self.target_left_eye, estimate) {
-                eye_tracker.send_now(output.chain(input))?;
+                eye_tracker.tx.send_now(output.chain(input))?;
             }
         }
         if let Some(ir_auto_focus) = self.ir_auto_focus.enabled() {
             if self.ir_auto_focus_use_rgb_net_estimate {
-                ir_auto_focus.send_now(output.chain(estimate.into()))?;
+                ir_auto_focus.tx.send_now(output.chain(estimate.into()))?;
             }
         }
         if let Some(distance) = self.distance.enabled() {
-            distance.send_now(output.chain(distance::Input::RgbNetEstimate(estimate.clone())))?;
+            distance
+                .tx
+                .send_now(output.chain(distance::Input::RgbNetEstimate(estimate.clone())))?;
         }
         Ok(())
     }
@@ -1025,7 +1188,7 @@ impl Orb {
             self.pre_handle_rgb_net_estimate(&output, estimate)?;
             if let Some(image_notary) = self.image_notary.enabled() {
                 // Timestamps are generated in the image_notary history, so send there first.
-                image_notary.send_now(port::Input::new(
+                image_notary.tx.send_now(port::Input::new(
                     image_notary::Input::SaveRgbNetEstimate(
                         image_notary::SaveRgbNetEstimateInput {
                             estimate: estimate.clone(),
@@ -1068,8 +1231,8 @@ impl Orb {
         macro_rules! restore_frame {
             () => {
                 loop {
-                    if let Some((frame, source_ts)) = self.rgb_net_frames.pop_front() {
-                        if source_ts == source_ts {
+                    if let Some((frame, frame_source_ts)) = self.rgb_net_frames.pop_front() {
+                        if frame_source_ts == source_ts {
                             break frame;
                         }
                     } else {
@@ -1092,7 +1255,7 @@ impl Orb {
 
         if let Some(image_notary) = self.image_notary.enabled() {
             // Timestamps are generated in the image_notary history, so send there first.
-            image_notary.send_now(port::Input::new(image_notary::Input::SaveFusionRnFi(
+            image_notary.tx.send_now(port::Input::new(image_notary::Input::SaveFusionRnFi(
                 image_notary::SaveFusionRnFiInput {
                     estimate: rn_output,
                     is_valid: fi_output,
@@ -1115,8 +1278,14 @@ impl Orb {
         plan: &mut dyn Plan,
         output: port::Output<camera::thermal::Sensor>,
     ) -> Result<BrokerFlow> {
+        #[cfg(feature = "livestream")]
+        if let Some(livestream) = self.livestream.enabled() {
+            livestream
+                .tx
+                .send_now(output.chain(livestream::Input::ThermalFrame(output.value.clone())))?;
+        }
         if let Some(image_notary) = self.image_notary.enabled() {
-            image_notary.send_now(port::Input::new(image_notary::Input::SaveThermalData(
+            image_notary.tx.send_now(port::Input::new(image_notary::Input::SaveThermalData(
                 image_notary::SaveThermalDataInput {
                     frame: output.value.clone(),
                     wavelength: self.ir_led_wavelength,
@@ -1126,6 +1295,20 @@ impl Orb {
             )))?;
         }
         plan.handle_thermal_camera(self, output)
+    }
+
+    fn handle_depth_camera(
+        &mut self,
+        plan: &mut dyn Plan,
+        output: port::Output<camera::depth::Sensor>,
+    ) -> Result<BrokerFlow> {
+        #[cfg(feature = "livestream")]
+        if let Some(livestream) = self.livestream.enabled() {
+            livestream
+                .tx
+                .send_now(output.chain(livestream::Input::DepthFrame(output.value.clone())))?;
+        }
+        plan.handle_depth_camera(self, output)
     }
 
     fn handle_ir_net(
@@ -1151,29 +1334,36 @@ impl Orb {
         let mut frame = None;
         if let ir_net::Output::Estimate(estimate) = &output.value {
             let frame = frame.insert(restore_frame!());
+            #[cfg(feature = "livestream")]
+            if let Some(livestream) = self.livestream.enabled() {
+                livestream
+                    .tx
+                    .send_now(output.chain(livestream::Input::IrNetEstimate(estimate.clone())))?;
+            }
             if let Some(image_notary) = self.image_notary.enabled() {
                 // Timestamps are generated in the image_notary history, so send there first.
-                image_notary.send_now(port::Input::new(image_notary::Input::SaveIrNetEstimate(
-                    image_notary::SaveIrNetEstimateInput {
+                image_notary.tx.send_now(port::Input::new(
+                    image_notary::Input::SaveIrNetEstimate(image_notary::SaveIrNetEstimateInput {
                         estimate: Some(estimate.clone()),
                         frame: frame.clone(),
                         wavelength: self.ir_led_wavelength,
                         target_left_eye: self.target_left_eye,
                         fps_override: self.ir_eye_save_fps_override,
                         log_metadata_always: true,
-                    },
-                )))?;
+                    }),
+                ))?;
             }
             if let Some(ir_auto_focus) = self.ir_auto_focus.enabled() {
-                ir_auto_focus.send_now(output.chain(estimate.into()))?;
+                ir_auto_focus.tx.send_now(output.chain(estimate.into()))?;
             }
             if let Some(eye_pid_controller) = self.eye_pid_controller.enabled() {
-                eye_pid_controller.send_now(
+                eye_pid_controller.tx.send_now(
                     output.chain(eye_pid_controller::Input::IrNetEstimate(estimate.clone())),
                 )?;
             }
             if let Some(distance) = self.distance.enabled() {
                 distance
+                    .tx
                     .send_now(output.chain(distance::Input::IrNetEstimate(estimate.clone())))?;
             }
         }
@@ -1244,6 +1434,10 @@ impl Orb {
     ) -> Result<BrokerFlow> {
         let value = output.value;
         self.main_mcu.send_now(mcu::main::Input::LiquidLens(Some(value)))?;
+        #[cfg(feature = "livestream")]
+        if let Some(livestream) = self.livestream.enabled() {
+            livestream.tx.send_now(output.chain(livestream::Input::Focus(value)))?;
+        }
         plan.handle_ir_auto_focus(self, output)
     }
 
@@ -1255,16 +1449,22 @@ impl Orb {
     ) -> Result<BrokerFlow> {
         let ir_auto_exposure::Output { gain, exposure } = output.value;
         if let Some(ir_eye_camera) = self.ir_eye_camera.enabled() {
-            ir_eye_camera.send_now(output.chain(camera::ir::Command::SetGain(gain)))?;
+            ir_eye_camera.tx.send_now(output.chain(camera::ir::Command::SetGain(gain)))?;
             ir_eye_camera
+                .tx
                 .send_now(output.chain(camera::ir::Command::SetExposure(exposure.into())))?;
         }
         if let Some(ir_face_camera) = self.ir_face_camera.enabled() {
-            ir_face_camera.send_now(output.chain(camera::ir::Command::SetGain(gain)))?;
+            ir_face_camera.tx.send_now(output.chain(camera::ir::Command::SetGain(gain)))?;
             ir_face_camera
+                .tx
                 .send_now(output.chain(camera::ir::Command::SetExposure(exposure.into())))?;
         }
         self.set_ir_duration(exposure)?;
+        #[cfg(feature = "livestream")]
+        if let Some(livestream) = self.livestream.enabled() {
+            livestream.tx.send_now(output.chain(livestream::Input::Exposure(exposure)))?;
+        }
         Ok(BrokerFlow::Continue)
     }
 
@@ -1276,10 +1476,13 @@ impl Orb {
     ) -> Result<BrokerFlow> {
         let mirror_point = output.value;
         self.mirror_point = Some(mirror_point);
+        let point = mirror_point + self.mirror_offset.unwrap_or_default();
         if let Some(mirror) = self.mirror.enabled() {
-            mirror.send_now(output.chain(mirror::Command::SetPoint(
-                mirror_point + self.mirror_offset.unwrap_or_default(),
-            )))?;
+            mirror.tx.send_now(output.chain(mirror::Command::SetPoint(point)))?;
+        }
+        #[cfg(feature = "livestream")]
+        if let Some(livestream) = self.livestream.enabled() {
+            livestream.tx.send_now(output.chain(livestream::Input::SetMirrorPoint(point)))?;
         }
         Ok(BrokerFlow::Continue)
     }
@@ -1292,11 +1495,14 @@ impl Orb {
     ) -> Result<BrokerFlow> {
         let mirror_offset = output.value;
         self.mirror_offset = Some(mirror_offset);
-        if let Some(mirror) = self.mirror.enabled() {
-            if let Some(mirror_point) = self.mirror_point {
-                mirror.send_now(
-                    output.chain(mirror::Command::SetPoint(mirror_point + mirror_offset)),
-                )?;
+        if let Some(mirror_point) = self.mirror_point {
+            let point = mirror_point + mirror_offset;
+            if let Some(mirror) = self.mirror.enabled() {
+                mirror.tx.send_now(output.chain(mirror::Command::SetPoint(point)))?;
+            }
+            #[cfg(feature = "livestream")]
+            if let Some(livestream) = self.livestream.enabled() {
+                livestream.tx.send_now(output.chain(livestream::Input::SetMirrorPoint(point)))?;
             }
         }
         Ok(BrokerFlow::Continue)
@@ -1308,18 +1514,29 @@ impl Orb {
         plan: &mut dyn Plan,
         output: port::Output<mirror::Actuator>,
     ) -> Result<BrokerFlow> {
-        let (x, y) = output.value;
-        self.main_mcu.send_now(mcu::main::Input::Mirror(x, y))?;
+        let (phi, theta) = output.value;
+        let (phi, theta) = if identification::HARDWARE_VERSION.contains("Diamond") {
+            (
+                phi.clamp(MIRROR_PHI_MIN_DIAMOND, MIRROR_PHI_MAX_DIAMOND),
+                theta.clamp(MIRROR_THETA_MIN_DIAMOND, MIRROR_THETA_MAX_DIAMOND),
+            )
+        } else {
+            (
+                phi.clamp(MIRROR_PHI_MIN_PEARL, MIRROR_PHI_MAX_PEARL),
+                theta.clamp(MIRROR_THETA_MIN_PEARL, MIRROR_THETA_MAX_PEARL),
+            )
+        };
+        self.main_mcu.send_now(mcu::main::Input::Mirror(phi, theta))?;
         plan.handle_mirror(self, output)
     }
 
     #[allow(clippy::unused_self, clippy::needless_pass_by_value, clippy::unnecessary_wraps)]
     fn handle_distance(
         &mut self,
-        _plan: &mut dyn Plan,
+        plan: &mut dyn Plan,
         output: port::Output<distance::Agent>,
     ) -> Result<BrokerFlow> {
-        match output.value {}
+        plan.handle_distance(self, output)
     }
 
     #[allow(clippy::unused_self, clippy::needless_pass_by_value, clippy::unnecessary_wraps)]
@@ -1328,14 +1545,30 @@ impl Orb {
         plan: &mut dyn Plan,
         output: port::Output<qr_code::Agent>,
     ) -> Result<BrokerFlow> {
+        #[cfg(feature = "livestream")]
+        if let Some(livestream) = self.livestream.enabled() {
+            livestream.tx.send_now(port::Input::new(livestream::Input::QrCode(
+                output.value.points.clone(),
+            )))?;
+        }
         plan.handle_qr_code(self, output)
     }
 
+    #[cfg(feature = "internal-data-acquisition")]
     #[allow(clippy::unused_self, clippy::needless_pass_by_value)]
     fn handle_image_uploader(
         &mut self,
         _plan: &mut dyn Plan,
         output: port::Output<image_uploader::Agent>,
+    ) -> Result<BrokerFlow> {
+        match output.value {}
+    }
+
+    #[allow(clippy::unused_self, clippy::needless_pass_by_value)]
+    fn handle_data_uploader(
+        &mut self,
+        _plan: &mut dyn Plan,
+        output: port::Output<data_uploader::Agent>,
     ) -> Result<BrokerFlow> {
         match output.value {}
     }
@@ -1353,41 +1586,21 @@ impl Orb {
         Ok(BrokerFlow::Continue)
     }
 
+    #[cfg(feature = "livestream")]
+    #[allow(clippy::unused_self, clippy::needless_pass_by_value)]
+    fn handle_livestream(
+        &mut self,
+        _plan: &mut dyn Plan,
+        output: port::Output<livestream::Agent>,
+    ) -> Result<BrokerFlow> {
+        match output.value {}
+    }
+
     fn exposure_range(&self) -> RangeInclusive<u16> {
         match self.ir_led_wavelength {
             IrLed::L740 => IR_LED_MIN_DURATION..=IR_LED_MAX_DURATION_740NM,
             _ => IR_LED_MIN_DURATION..=IR_LED_MAX_DURATION,
         }
-    }
-
-    /// Shuts down the orb.
-    pub async fn shutdown(&mut self) -> Result<Infallible> {
-        DATADOG.incr("orb.main.count.global.shutting_down", NO_TAGS)?;
-        tracing::info!("Shutting down the Orb");
-        self.sound.build(sound::Type::Melody(Melody::PoweringDown))?.priority(3).push()?.await;
-
-        // save latest config to disk
-        tracing::info!("Starting to write config to disk");
-        self.config.lock().await.store().await?;
-        sync(); // sync filesystem
-        tracing::info!("Config written to disk");
-
-        // shutdown comes from the MCU in last resort
-        self.main_mcu.send(mcu::main::Input::Shutdown(GRACEFUL_SHUTDOWN_MAX_DELAY_SECONDS)).await?;
-        let connection = zbus::Connection::session()
-            .await
-            .wrap_err("failed establishing a `session` dbus connection")?;
-        let proxy =
-            SupervisorProxy::new(&connection).await.wrap_err("failed creating supervisor proxy")?;
-        tracing::info!(
-            "scheduling poweroff in 0ms by calling \
-             org.worldcoin.OrbSupervisor1.Manager.ScheduleShutdown"
-        );
-        proxy
-            .schedule_shutdown("poweroff", 0)
-            .await
-            .wrap_err("failed to schedule poweroff to supervisor proxy")?;
-        process::exit(0);
     }
 
     fn poll_extra(
@@ -1400,5 +1613,11 @@ impl Orb {
             return Ok(Some(Poll::Ready(())));
         }
         Ok(Some(Poll::Pending))
+    }
+
+    async fn process_logger(
+        &self,
+    ) -> impl Fn(&'static str, ChildStdout, ChildStderr) -> BoxFuture<()> + Send + 'static {
+        process_logger(self.config.lock().await.process_agent_logger_pruning)
     }
 }

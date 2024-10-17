@@ -9,17 +9,18 @@ use crate::{
         python::{
             face_identifier, ir_net,
             iris::{self, Metadata, NormalizedIris},
-            mega_agent_one, mega_agent_two, rgb_net,
+            mega_agent_one, mega_agent_two, occlusion, rgb_net,
         },
     },
-    brokers::{BrokerFlow, Orb, OrbPlan},
-    logger::{DATADOG, NO_TAGS},
+    brokers::{Orb, OrbPlan},
+    dd_timing,
     plans::biometric_capture::Capture,
-    port,
 };
+use agentwire::{port, BrokerFlow};
+use ai_interface::PyError;
 use eyre::{Context as EyreContext, Result};
 use futures::prelude::*;
-use python_agent_interface::PyError;
+use orb_wld_data_id::SignupId;
 use std::{
     pin::Pin,
     task::{Context, Poll},
@@ -32,13 +33,19 @@ use tokio::time;
 const MODEL_TIMEOUT: Duration = Duration::from_secs(90);
 
 const MIN_PROGRESS: f64 = 0.075;
-const MAX_PROGRESS: f64 = 0.9;
-const FACE_IDENTIFIER_PROGRESS: f64 = 0.031_430_735_316_813_85;
+const MAX_PROGRESS: f64 = 0.85;
+const OCCLUSION_PROGRESS: f64 = 0.001_945_999_016_979_255_1;
+const FACE_IDENTIFIER_PROGRESS: f64 = 0.005_116_455_645_242_144;
 const IRIS_ESTIMATE_PROGRESS: f64 = 0.484_430_735_316_813_85;
+#[allow(dead_code)]
+const CONTACT_LENS_PROGRESS: f64 = 0.012_013_037_352_075_446;
 
 #[allow(clippy::assertions_on_constants)]
 const _: () = {
-    let mut total = FACE_IDENTIFIER_PROGRESS + IRIS_ESTIMATE_PROGRESS * 2.0;
+    let mut total = OCCLUSION_PROGRESS
+        + FACE_IDENTIFIER_PROGRESS
+        + IRIS_ESTIMATE_PROGRESS * 2.0
+        + CONTACT_LENS_PROGRESS * 2.0;
     total -= 1.0;
     if total < 0.0 {
         total = -total;
@@ -51,6 +58,10 @@ const _: () = {
 pub struct Pipeline {
     /// Pipeline v2 output.
     pub v2: PipelineV2,
+    /// Occlusion detection estimate output.
+    pub occlusion: Result<occlusion::EstimateOutput, PyError>,
+    /// Face identifier model output for the fraud checks.
+    pub face_identifier_fraud_checks: Result<face_identifier::FraudChecks, PyError>,
     /// Face identifier model output for the self-custody bundle.
     pub face_identifier_bundle: Result<face_identifier::Bundle, PyError>,
     /// Mega Agent One's configuration.
@@ -66,6 +77,8 @@ impl Pipeline {
         let config = crate::config::Config::default();
         Self {
             v2: PipelineV2::default(),
+            occlusion: Ok(occlusion::EstimateOutput::default()),
+            face_identifier_fraud_checks: Ok(face_identifier::FraudChecks::default()),
             face_identifier_bundle: Ok(face_identifier::Bundle::default()),
             mega_agent_one_config: mega_agent_one::MegaAgentOne::from(&config),
             mega_agent_two_config: mega_agent_two::MegaAgentTwo::from(&config),
@@ -89,9 +102,13 @@ pub struct PipelineV2 {
 /// Processed data for one of the user's eyes.
 #[derive(Clone, Debug, Default)]
 pub struct EyePipeline {
-    /// Iris Code.
+    /// The Iris code shares.
+    pub iris_code_shares: [String; 3],
+    /// The Iris mask code shares.
+    pub mask_code_shares: [String; 3],
+    /// The Iris code.
     pub iris_code: String,
-    /// Mask Code.
+    /// The Iris mask code.
     pub mask_code: String,
     /// The Iris code version.
     pub iris_code_version: String,
@@ -99,11 +116,14 @@ pub struct EyePipeline {
     pub metadata: Metadata,
     /// Iris normalized image.
     pub iris_normalized_image: Option<NormalizedIris>,
+    /// Resized Iris normalized image.
+    pub iris_normalized_image_resized: Option<NormalizedIris>,
 }
 
 /// Biometric pipeline plan.
 pub struct Plan {
     timeout: Pin<Box<time::Sleep>>,
+    signup_id: SignupId,
     model_output: Option<ModelOutput>,
     eye_left: camera::ir::Frame,
     eye_right: camera::ir::Frame,
@@ -205,9 +225,10 @@ impl Plan {
     /// # Panics
     ///
     /// If RGB-Net estimate doesn't contain predictions.
-    pub fn new(capture: &Capture) -> Result<Self> {
+    pub fn new(capture: &Capture, signup_id: SignupId) -> Result<Self> {
         Ok(Self {
             timeout: Box::pin(time::sleep(MODEL_TIMEOUT)),
+            signup_id,
             model_output: None,
             eye_left: capture.eye_left.ir_frame.clone(),
             eye_right: capture.eye_right.ir_frame.clone(),
@@ -256,6 +277,8 @@ impl Plan {
         let mut iris_right = None;
         let mut iris_version = None;
         let mut ir_net_version = None;
+        let mut occlusion = None;
+        let mut face_identifier_fraud_checks = None;
         let mut face_identifier_bundle = None;
         let mut face_identifier_update_config = None;
         let mut mega_agent_one_config = None;
@@ -278,11 +301,14 @@ impl Plan {
         // Start biometric data processing
         self.run_iris_left(orb).await?;
         self.run_iris_right(orb).await?;
+        self.run_occlusion(orb).await?;
         self.run_face_identifier(orb).await?;
         self.set_timeout();
 
         while iris_version.is_none()
             || ir_net_version.is_none()
+            || occlusion.is_none()
+            || face_identifier_fraud_checks.is_none()
             || face_identifier_bundle.is_none()
             || mega_agent_one_config.is_none()
             || mega_agent_two_config.is_none()
@@ -292,11 +318,13 @@ impl Plan {
             orb.run_with_fence(self, fence).await?;
             match self.model_output.take().unwrap() {
                 ModelOutput::FaceIdentifier(output) => match output {
-                    face_identifier::Output::Estimate { bundle } => {
+                    face_identifier::Output::Estimate { fraud_checks, bundle } => {
+                        face_identifier_fraud_checks = Some(Ok(fraud_checks));
                         face_identifier_bundle = Some(Ok(bundle));
                         progress += FACE_IDENTIFIER_PROGRESS;
                     }
                     face_identifier::Output::Error(error) => {
+                        face_identifier_fraud_checks = Some(Err(error.clone()));
                         face_identifier_bundle = Some(Err(error.clone()));
                     }
                     o @ (face_identifier::Output::Warmup
@@ -312,21 +340,34 @@ impl Plan {
                         mega_agent_one::Output::Config(config) => {
                             mega_agent_one_config = Some(config);
                         }
+                        mega_agent_one::Output::Occlusion(occlusion::Output::Estimate(output)) => {
+                            occlusion = Some(Ok(output));
+                            progress += OCCLUSION_PROGRESS;
+                        }
+                        mega_agent_one::Output::Occlusion(occlusion::Output::Error(error)) => {
+                            occlusion = Some(Err(error));
+                        }
                         mega_agent_one::Output::Iris(iris::Output::Estimate(
                             iris::EstimateOutput {
+                                iris_code_shares,
+                                mask_code_shares,
                                 iris_code,
                                 mask_code,
                                 iris_code_version,
                                 metadata,
                                 normalized_image,
+                                normalized_image_resized,
                             },
                         )) => {
                             iris_left = Some(EyePipeline {
+                                iris_code_shares,
+                                mask_code_shares,
                                 iris_code,
                                 mask_code,
                                 iris_code_version,
                                 metadata,
                                 iris_normalized_image: normalized_image,
+                                iris_normalized_image_resized: normalized_image_resized,
                             });
 
                             self.set_timeout();
@@ -348,33 +389,37 @@ impl Plan {
                     }
                 }
                 ModelOutput::MegaAgentTwo(output) => match output {
-                    mega_agent_two::Output::Iris(iris::Output::Estimate(
-                        iris::EstimateOutput {
+                    mega_agent_two::Output::Iris(boxed_output) => match *boxed_output {
+                        iris::Output::Estimate(iris::EstimateOutput {
+                            iris_code_shares,
+                            mask_code_shares,
                             iris_code,
                             mask_code,
                             iris_code_version,
                             metadata,
                             normalized_image,
-                        },
-                    )) => {
-                        iris_right = Some(EyePipeline {
-                            iris_code,
-                            mask_code,
-                            iris_code_version,
-                            metadata,
-                            iris_normalized_image: normalized_image,
-                        });
+                            normalized_image_resized,
+                        }) => {
+                            iris_right = Some(EyePipeline {
+                                iris_code_shares,
+                                mask_code_shares,
+                                iris_code,
+                                mask_code,
+                                iris_code_version,
+                                metadata,
+                                iris_normalized_image: normalized_image,
+                                iris_normalized_image_resized: normalized_image_resized,
+                            });
 
-                        self.set_timeout();
-                        progress += IRIS_ESTIMATE_PROGRESS;
-                    }
-                    mega_agent_two::Output::Iris(iris::Output::Version(version)) => {
-                        iris_version = Some(version);
-                    }
-                    mega_agent_two::Output::Iris(
-                        iris::Output::Error(error),
+                            self.set_timeout();
+                            progress += IRIS_ESTIMATE_PROGRESS;
+                        }
+                        iris::Output::Version(version) => {
+                            iris_version = Some(version);
+                        }
                         // If IIP or Iris fail, there is not much we can do.
-                    ) => return Err(Error::Iris(error))?,
+                        iris::Output::Error(error) => return Err(Error::Iris(error))?,
+                    },
                     mega_agent_two::Output::Config(config) => {
                         mega_agent_two_config = Some(config);
                     }
@@ -389,6 +434,11 @@ impl Plan {
                     let pending_results: Vec<String> = vec![
                         ("iris_left".to_owned(), iris_left.is_none()),
                         ("iris_right".to_owned(), iris_right.is_none()),
+                        ("occlusion".to_owned(), occlusion.is_none()),
+                        (
+                            "face_identifier_checks".to_owned(),
+                            face_identifier_fraud_checks.is_none(),
+                        ),
                         ("face_identifier_bundle".to_owned(), face_identifier_bundle.is_none()),
                         (
                             "face_identifier_update_config".to_owned(),
@@ -412,7 +462,7 @@ impl Plan {
                     return Err(Error::Timeout)?;
                 }
             }
-            orb.led.biometric_pipeline_progress(
+            orb.ui.biometric_pipeline_progress(
                 MIN_PROGRESS + progress * (MAX_PROGRESS - MIN_PROGRESS),
             );
         }
@@ -421,11 +471,7 @@ impl Plan {
         orb.disable_mega_agent_two();
 
         tracing::info!("Biometric pipeline <benchmark>: {} ms", now.elapsed().as_millis());
-        DATADOG.timing(
-            "orb.main.time.signup.biometric_process",
-            now.elapsed().as_millis().try_into()?,
-            NO_TAGS,
-        )?;
+        dd_timing!("main.time.signup.biometric_process", now);
 
         Ok(Pipeline {
             v2: PipelineV2 {
@@ -434,6 +480,8 @@ impl Plan {
                 ir_net_version: ir_net_version.unwrap(),
                 iris_version: iris_version.clone().unwrap(),
             },
+            occlusion: occlusion.unwrap(),
+            face_identifier_fraud_checks: face_identifier_fraud_checks.unwrap(),
             face_identifier_bundle: face_identifier_bundle.unwrap(),
             mega_agent_one_config: mega_agent_one_config.unwrap(),
             mega_agent_two_config: mega_agent_two_config.unwrap(),
@@ -472,6 +520,7 @@ impl Plan {
         self.run_mega_agent_two(
             orb,
             mega_agent_two::Input::FaceIdentifier(face_identifier::Input::Estimate {
+                signup_id: self.signup_id.to_string(),
                 frame_left: self.face_left.clone(),
                 frame_right: self.face_right.clone(),
                 frame_self_custody_candidate: self.face_self_custody_candidate.clone(),
@@ -481,6 +530,18 @@ impl Plan {
                 bbox_left: self.face_bbox_left,
                 bbox_right: self.face_bbox_right,
                 bbox_self_custody_candidate: self.face_bbox_self_custody_candidate,
+            }),
+        )
+        .await
+    }
+
+    async fn run_occlusion(&mut self, orb: &mut Orb) -> Result<()> {
+        tracing::info!("Run [Occlusion Detection :: estimate]",);
+        self.run_mega_agent_one(
+            orb,
+            mega_agent_one::Input::Occlusion(occlusion::Input::Estimate {
+                frame: self.face_left.clone(),
+                bbox: self.face_bbox_left,
             }),
         )
         .await

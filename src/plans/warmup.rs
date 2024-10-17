@@ -5,9 +5,10 @@ use crate::{
         camera,
         python::{face_identifier, ir_net, mega_agent_one, mega_agent_two, rgb_net},
     },
-    brokers::{BrokerFlow, Orb, OrbPlan},
-    monitor, port,
+    brokers::{Orb, OrbPlan},
+    monitor,
 };
+use agentwire::{port, BrokerFlow};
 use eyre::{bail, Result};
 use futures::prelude::*;
 use std::time::Instant;

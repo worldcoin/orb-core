@@ -4,12 +4,12 @@
 
 pub mod can;
 pub mod main;
-pub mod serial;
+
+use std::pin::Pin;
 
 pub use self::main::Main;
 
 use crate::ext::mpsc::SenderExt as _;
-use async_trait::async_trait;
 use eyre::{Error, Result};
 use futures::{
     channel::{mpsc, oneshot},
@@ -64,7 +64,6 @@ pub trait Interface {
 ///
 /// It is split into two traits `Mcu` and `Interface` because of Rust object
 /// safety rules.
-#[async_trait]
 pub trait Mcu<I: Interface>: Send {
     /// Returns a new handler to the shared microcontroller interface.
     fn clone(&self) -> Box<dyn Mcu<I>>;
@@ -85,26 +84,28 @@ pub trait Mcu<I: Interface>: Send {
     fn log_mut(&mut self) -> &mut Option<I::Log>;
 
     /// Sends a message to the microcontroller and waits for the acknowledge.
-    async fn send(&mut self, input: I::Input) -> Result<()> {
-        let mut retries = SEND_RETRY_COUNT;
-        'retry: loop {
-            let (completion_tx, completion_rx) = oneshot::channel();
-            self.tx_mut().send((input.clone(), Some(completion_tx))).await?;
-            if let Err(error) = completion_rx.await? {
-                if retries > 0 {
-                    tracing::warn!("Retrying last µC message... [{}]", retries);
-                    retries -= 1;
-                    continue 'retry;
-                }
-                tracing::error!("Maximum µC send retries reached, aborting with Error");
-                return Err(error);
-            };
-            break 'retry;
-        }
-        if let Some(log) = self.log_mut() {
-            I::log_input(log, &input);
-        }
-        Ok(())
+    fn send(&mut self, input: I::Input) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
+        Box::pin(async move {
+            let mut retries = SEND_RETRY_COUNT;
+            'retry: loop {
+                let (completion_tx, completion_rx) = oneshot::channel();
+                self.tx_mut().send((input.clone(), Some(completion_tx))).await?;
+                if let Err(error) = completion_rx.await? {
+                    if retries > 0 {
+                        tracing::warn!("Retrying last µC message... [{}]", retries);
+                        retries -= 1;
+                        continue 'retry;
+                    }
+                    tracing::error!("Maximum µC send retries reached, aborting with Error");
+                    return Err(error);
+                };
+                break 'retry;
+            }
+            if let Some(log) = self.log_mut() {
+                I::log_input(log, &input);
+            }
+            Ok(())
+        })
     }
 
     /// Attempts to send a message to the microcontroller without waiting for

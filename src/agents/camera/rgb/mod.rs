@@ -5,26 +5,35 @@ pub mod worker;
 use self::worker::Worker;
 pub use self::worker::{ArchivedFrame, Frame};
 use super::Frame as _;
-use crate::{
-    agents::{AgentKill, AgentProcess},
-    ext::mpsc::SenderExt as _,
-    fisheye,
-    logger::{DATADOG, NO_TAGS},
-    port,
-    port::Port,
+use crate::{dd_timing, ext::mpsc::SenderExt as _, image::fisheye, process::Command as StdCommand};
+use agentwire::{
+    agent::{self, Process as _},
+    port::{self, Port},
 };
-use async_trait::async_trait;
-use eyre::{bail, Result, WrapErr};
-use futures::{channel::mpsc, future, future::Either, prelude::*};
+use eyre::{bail, Error, Result, WrapErr};
+use futures::{
+    channel::mpsc,
+    future::{self, BoxFuture, Either},
+    prelude::*,
+    select_biased,
+};
 use nix::{
     sys::signal::{kill, Signal},
     unistd::Pid,
 };
-use std::{convert::TryInto, fmt, process::Stdio, time::Duration};
-use tokio::{fs, process};
+use std::{fmt, pin::pin, process::Stdio, time::Duration};
+use tokio::{
+    fs,
+    io::{AsyncBufReadExt as _, BufReader},
+    process::{self, ChildStderr, ChildStdout, Command as TokioCommand},
+    time,
+};
+use tokio_stream::wrappers::IntervalStream;
 use walkdir::WalkDir;
 
 const NVARGUS_DAEMON: &str = "/usr/sbin/nvargus-daemon";
+const STARTUP_TIMEOUT: Duration = Duration::from_secs(6);
+const FRAME_TIMEOUT: Duration = Duration::from_millis(600);
 
 /// RGB camera sensor.
 ///
@@ -62,7 +71,10 @@ pub enum Command {
         undistortion_enabled: bool,
     },
     /// Start frame capturing.
-    Start,
+    Start {
+        /// Capture framerate.
+        fps: u32,
+    },
     /// Stop frame capturing.
     Stop,
     /// Ensure no stale frames leak into the next capture by fully restarting
@@ -77,7 +89,8 @@ struct Manager {
     fisheye_sent: bool,
     nvargus: process::Child,
     worker: port::Outer<Worker>,
-    worker_kill: AgentKill,
+    worker_kill: agent::Kill,
+    argus_error: mpsc::Receiver<()>,
 }
 
 impl Port for Sensor {
@@ -88,13 +101,14 @@ impl Port for Sensor {
     const OUTPUT_CAPACITY: usize = 0;
 }
 
-impl super::Agent for Sensor {
+impl agentwire::Agent for Sensor {
     const NAME: &'static str = "rgb-camera";
 }
 
-#[async_trait]
-impl super::AgentTask for Sensor {
-    async fn run(mut self, port: port::Inner<Self>) -> Result<()> {
+impl agentwire::agent::Task for Sensor {
+    type Error = Error;
+
+    async fn run(mut self, port: port::Inner<Self>) -> Result<(), Self::Error> {
         if let Some(fake_port) = self.fake_port.take() {
             run_fake(port, fake_port).await
         } else {
@@ -109,7 +123,8 @@ impl Manager {
         state_tx: Option<mpsc::Sender<super::State>>,
     ) -> Result<Self> {
         let nvargus = spawn_nvargus().await?;
-        let (worker, worker_kill) = Worker.spawn_process();
+        let (argus_error_tx, argus_error_rx) = mpsc::channel(1);
+        let (worker, worker_kill) = Worker.spawn_process(worker_logger(argus_error_tx));
         Ok(Manager {
             port,
             state_tx,
@@ -118,6 +133,7 @@ impl Manager {
             nvargus,
             worker,
             worker_kill,
+            argus_error: argus_error_rx,
         })
     }
 
@@ -128,20 +144,20 @@ impl Manager {
                     self.fisheye_config = undistortion_enabled.then_some(new_fisheye_config);
                     self.fisheye_sent = false;
                 }
-                Command::Start => {
+                Command::Start { fps } => {
                     if let Some(state_tx) = &mut self.state_tx {
                         state_tx.send_now(super::State::Capturing)?;
                     }
                     let mut retry = true;
                     while retry {
-                        (self, retry) = self.capture().await?;
+                        (self, retry) = self.capture(fps).await?;
                     }
                     if let Some(state_tx) = &mut self.state_tx {
                         state_tx.send_now(super::State::Idle)?;
                     }
                 }
                 Command::Reset => {
-                    self = self.worker_send_or_restart(worker::Command::Reset).await?;
+                    (self, _) = self.worker_send_or_restart(worker::Command::Reset).await?;
                 }
                 Command::Stop => bail!("rgb camera already stopped"),
             }
@@ -149,51 +165,68 @@ impl Manager {
         Ok(())
     }
 
-    async fn capture(mut self) -> Result<(Self, bool)> {
+    async fn capture(mut self, fps: u32) -> Result<(Self, bool)> {
         macro_rules! worker_send_or_retry {
-            ($command:expr) => {
-                match self.worker.send(port::Input::new($command)).await {
-                    Err(err) if err.is_disconnected() => {
-                        self = self.restart().await?;
-                        return Ok((self, true));
-                    }
-                    _ => {}
+            ($command:expr) => {{
+                let command = $command;
+                let restarted;
+                (self, restarted) = self.worker_send_or_restart(command).await?;
+                if restarted {
+                    return Ok((self, true));
                 }
-            };
+            }};
         }
 
         if !self.fisheye_sent {
             worker_send_or_retry!(worker::Command::FisheyeConfig(self.fisheye_config));
         }
-        worker_send_or_retry!(worker::Command::Play);
+        worker_send_or_retry!(worker::Command::Play(fps));
         self.fisheye_sent = true;
         let mut prev_timestamp = None;
+        let mut last_frame_ts = time::Instant::now();
+        let mut interval = time::interval_at(last_frame_ts + STARTUP_TIMEOUT, FRAME_TIMEOUT / 2);
+        interval.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
+        let mut interval = IntervalStream::new(interval).fuse();
         loop {
-            match future::select(self.worker.next(), self.port.next()).await {
-                Either::Left((Some(output), _)) => {
+            select_biased! {
+                output = self.worker.next() => if let Some(output) = output {
+                    last_frame_ts = time::Instant::now();
                     self.process_frame(output, &mut prev_timestamp)?;
-                }
-                Either::Right((Some(command), _)) => match command.value {
-                    Command::Fisheye {
-                        fisheye_config: new_fisheye_config,
-                        undistortion_enabled,
-                    } => {
-                        self.fisheye_config = undistortion_enabled.then_some(new_fisheye_config);
-                        worker_send_or_retry!(worker::Command::FisheyeConfig(self.fisheye_config));
-                    }
-                    Command::Start { .. } | Command::Reset => {
-                        bail!("rgb camera already started")
-                    }
-                    Command::Stop => break,
+                } else {
+                    self = self.restart().await?;
+                    return Ok((self, true));
                 },
-                Either::Left((None, _)) => {
+                command = self.port.next() => match command {
+                    Some(command) => match command.value {
+                        Command::Fisheye {
+                            fisheye_config: new_fisheye_config,
+                            undistortion_enabled,
+                        } => {
+                            self.fisheye_config = undistortion_enabled.then_some(new_fisheye_config);
+                            worker_send_or_retry!(worker::Command::FisheyeConfig(self.fisheye_config));
+                        }
+                        Command::Start { .. } | Command::Reset => {
+                            bail!("rgb camera already started")
+                        }
+                        Command::Stop => break,
+                    }
+                    None => break,
+                },
+                tick = interval.next() => {
+                    if tick.unwrap().saturating_duration_since(last_frame_ts) >= FRAME_TIMEOUT {
+                        tracing::warn!("RGB camera frame timeout");
+                        self = self.restart().await?;
+                        return Ok((self, true));
+                    }
+                }
+                _ = self.argus_error.next() => {
+                    tracing::warn!("Argus error detected");
                     self = self.restart().await?;
                     return Ok((self, true));
                 }
-                Either::Right((None, _)) => break,
             }
         }
-        self = self.worker_send_or_restart(worker::Command::Pause).await?;
+        (self, _) = self.worker_send_or_restart(worker::Command::Pause).await?;
         Ok((self, false))
     }
 
@@ -205,35 +238,41 @@ impl Manager {
         let derive = output.derive_fn();
         let timestamp = output.value.timestamp();
         if let Some(delay) = prev_timestamp.and_then(|prev| timestamp.checked_sub(prev)) {
-            DATADOG.timing(
-                "orb.main.time.camera.rgb_frame",
-                delay.as_millis().try_into()?,
-                NO_TAGS,
-            )?;
+            dd_timing!("main.time.camera.rgb_frame", delay);
         }
         *prev_timestamp = Some(timestamp);
-        self.port.send_now(derive(output.value))?;
+        self.port.tx.send_now(derive(output.value))?;
         Ok(())
     }
 
-    async fn worker_send_or_restart(mut self, command: worker::Command) -> Result<Self> {
-        match self.worker.send(port::Input::new(command)).await {
-            Err(err) if err.is_disconnected() => {
-                self = self.restart().await?;
-            }
-            _ => {}
-        }
-        Ok(self)
+    async fn worker_send_or_restart(mut self, command: worker::Command) -> Result<(Self, bool)> {
+        let restarted =
+            match time::timeout(STARTUP_TIMEOUT, self.worker.send(port::Input::new(command))).await
+            {
+                Err(_) => {
+                    tracing::warn!("RGB camera command timeout");
+                    self = self.restart().await?;
+                    true
+                }
+                Ok(Err(err)) if err.is_disconnected() => {
+                    self = self.restart().await?;
+                    true
+                }
+                Ok(Err(_) | Ok(())) => false,
+            };
+        Ok((self, restarted))
     }
 
     async fn restart(mut self) -> Result<Self> {
-        tracing::debug!("Restarting nvargus");
+        tracing::debug!("Restarting nvargus & gstreamer");
         if let Err(err) = self.nvargus.kill().await {
             tracing::warn!("nvargus-daemon kill failed: {err:?}");
         }
         self.worker_kill.await;
         self.nvargus = spawn_nvargus().await?;
-        (self.worker, self.worker_kill) = Worker.spawn_process();
+        let (argus_error_tx, argus_error_rx) = mpsc::channel(1);
+        (self.worker, self.worker_kill) = Worker.spawn_process(worker_logger(argus_error_tx));
+        self.argus_error = argus_error_rx;
         self.fisheye_sent = false;
         Ok(self)
     }
@@ -268,7 +307,7 @@ async fn spawn_nvargus() -> Result<process::Child> {
             let _ = kill(Pid::from_raw(pid), Signal::SIGKILL);
         }
     }
-    process::Command::new(NVARGUS_DAEMON)
+    TokioCommand::from(StdCommand::new(NVARGUS_DAEMON))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -292,4 +331,45 @@ async fn run_fake(mut port: port::Inner<Sensor>, mut fake_port: port::Outer<Sens
         }
     }
     Ok(())
+}
+
+fn worker_logger(
+    argus_error: mpsc::Sender<()>,
+) -> impl Fn(&'static str, ChildStdout, ChildStderr) -> BoxFuture<()> + Send + 'static {
+    move |agent_name, stdout, stderr| {
+        let mut argus_error = argus_error.clone();
+        Box::pin(async move {
+            let mut stdout = BufReader::new(stdout).lines();
+            let mut stderr = BufReader::new(stderr).lines();
+            loop {
+                match future::select(pin!(stdout.next_line()), pin!(stderr.next_line())).await {
+                    Either::Left((Ok(Some(line)), _)) => {
+                        tracing::info!("[{agent_name}] <STDOUT> {line}");
+                    }
+                    Either::Right((Ok(Some(line)), _)) => {
+                        tracing::info!("[{agent_name}] <STDERR> {line}");
+                        if line.starts_with("(Argus) Error ") {
+                            argus_error.send(()).await.unwrap();
+                        }
+                    }
+                    Either::Left((Ok(None), _)) => {
+                        tracing::warn!("[{agent_name}] <STDOUT> closed");
+                        break;
+                    }
+                    Either::Right((Ok(None), _)) => {
+                        tracing::warn!("[{agent_name}] <STDERR> closed");
+                        break;
+                    }
+                    Either::Left((Err(err), _)) => {
+                        tracing::error!("[{agent_name}] <STDOUT> {err:#?}");
+                        break;
+                    }
+                    Either::Right((Err(err), _)) => {
+                        tracing::error!("[{agent_name}] <STDERR> {err:#?}");
+                        break;
+                    }
+                }
+            }
+        })
+    }
 }

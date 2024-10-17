@@ -19,7 +19,7 @@ fn main() -> Result<()> {
         .header("wrapper.h")
         .clang_args(env::var("EXTRA_CLANG_CFLAGS")?.split_ascii_whitespace())
         .clang_args(env::var("NIX_CFLAGS_COMPILE")?.split_ascii_whitespace())
-        .parse_callbacks(Box::new(bindgen::CargoCallbacks))
+        .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))
         .parse_callbacks(Box::new(ConstifyMacro {}))
         .derive_debug(true)
         // Disabled impl_debug because it causes hard compilation errors in rust 1.69.

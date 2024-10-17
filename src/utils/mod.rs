@@ -1,10 +1,27 @@
 //! Utils module that can be used by multiple agents.
 
 pub mod rkyv_ndarray;
+pub mod serializable_instant;
+pub mod serialize_with_sorted_keys;
 
 pub use self::rkyv_ndarray::RkyvNdarray;
 
-use std::{ffi::CString, thread, time::Duration};
+use crate::consts::CONFIG_DIR;
+use std::{ffi::CString, fs, path::Path, thread, time::Duration};
+
+/// Returns the contents of ip-geo info from cached file on the Orb. In case of error, returns "unknown".
+#[must_use]
+pub fn ip_geo_info(cache_file_name: &str) -> Option<String> {
+    let path = Path::new(CONFIG_DIR).join(cache_file_name);
+    if !path.exists() {
+        tracing::warn!("Config file at {} not exists", path.display());
+        return None;
+    }
+    tracing::info!("Loading cached data from {}", path.display());
+    let contents = fs::read_to_string(path);
+    tracing::debug!("Cached file contents: {contents:#?}");
+    contents.map_err(|e| tracing::error!("Error reading cached file {cache_file_name}: {e}")).ok()
+}
 
 /// Sample the rate of a function over a given time period.
 /// Returns `true` if sampling should be performed.
@@ -18,6 +35,8 @@ pub fn sample_at_fps(fps: f32, current_time: Duration, last_saved_time: Duration
 /// Logs iris data (no-op).
 #[cfg(not(feature = "log-iris-data"))]
 pub fn log_iris_data(
+    _iris_code_shares: &[String; 3],
+    _mask_code_shares: &[String; 3],
     _iris_code: &str,
     _mask_code: &str,
     _iris_code_version: &str,
@@ -29,6 +48,8 @@ pub fn log_iris_data(
 /// Logs iris data.
 #[cfg(feature = "log-iris-data")]
 pub fn log_iris_data(
+    _iris_code_shares: &[String; 3],
+    _mask_code_shares: &[String; 3],
     iris_code: &str,
     mask_code: &str,
     iris_code_version: &str,

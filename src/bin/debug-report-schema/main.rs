@@ -40,22 +40,7 @@ fn main() -> Result<ExitCode> {
                     println!("DebugReport version is up to date.");
                     Ok(ExitCode::SUCCESS)
                 }
-                Err(e) => match e.downcast_ref::<SchemaError>() {
-                    Some(SchemaError::CannotInline(names)) => {
-                        println!(
-                            "Some structs on your recent changes have nested fields with structs \
-                             of the same name:"
-                        );
-                        for name in names {
-                            println!("- {}", name);
-                        }
-                        println!("This is not supported:");
-                        println!("struct Config {{\n\tcfg_a: a::Config,\n\tcfg_b: b::Config \n}}");
-                        println!("To resolve the issue use #[schemars(rename = \"...\"]).");
-                        Ok(ExitCode::FAILURE)
-                    }
-                    _ => Err(e),
-                },
+                Err(e) => Err(e),
             }
         }
         CliCommand::Export => {
@@ -138,39 +123,6 @@ fn output_files_schema_settings() -> SchemaSettings {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[allow(dead_code)]
-    mod a {
-        use super::*;
-        #[derive(JsonSchema)]
-        pub struct Config {
-            field: i32,
-        }
-    }
-
-    #[allow(dead_code)]
-    mod b {
-        use super::*;
-        #[derive(JsonSchema)]
-        pub struct Config {
-            field: f64,
-        }
-    }
-
-    #[allow(dead_code)]
-    #[derive(JsonSchema)]
-    struct Config {
-        cfg_a: a::Config,
-        cfg_b: b::Config,
-    }
-
-    #[test]
-    fn test_naming_conflict_detected() {
-        // This test is added to ensure that we detect this [issue](https://github.com/GREsau/schemars/issues/62).
-        // Delete this test if a library update fixes the above.
-        let schema_string = schema_to_string::<Config>(version_hash_schema_settings());
-        assert!(schema_string.is_err());
-    }
 
     #[allow(dead_code)]
     #[derive(JsonSchema)]

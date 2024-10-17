@@ -2,6 +2,7 @@
 
 #![allow(clippy::used_underscore_binding)] // triggered by rkyv
 
+mod extracts;
 /// Iris model python agent types.
 pub mod types;
 
@@ -11,19 +12,22 @@ use crate::{
     agents::{
         camera,
         python::{check_model_version, choose_config, AgentPython},
-        Agent,
+        ProcessInitializer,
     },
     config::Config,
     consts::{IR_HEIGHT, IR_WIDTH},
-    inst_elapsed,
-    logger::{LogOnError, DATADOG, NO_TAGS},
-    port::{Port, SharedPort},
+    dd_timing,
     utils::log_iris_data,
 };
-use eyre::Result;
+use agentwire::{
+    agent::{self, Agent as _},
+    port::{self, Port, SharedPort},
+};
+use ai_interface::{InitAgent, PyError};
+use eyre::{Error, Result};
+use iris_mpc::{galois_engine::degree4::GaloisRingIrisCodeShare, iris_db::iris::IrisCodeArray};
 use numpy::PyArray2;
 use pyo3::{types::PyDict, PyAny, PyErr, Python};
-use python_agent_interface::{InitAgent, PyError};
 use rkyv::{Archive, Deserialize, Serialize};
 use schemars::JsonSchema;
 use serde::Serialize as SerdeSerialize;
@@ -74,9 +78,13 @@ pub enum Output {
 /// Iris estimate output.
 #[derive(Debug, Archive, Serialize, Deserialize)]
 pub struct EstimateOutput {
+    /// The Iris code shares.
+    pub iris_code_shares: [String; 3],
+    /// The Iris mask code shares.
+    pub mask_code_shares: [String; 3],
     /// The Iris code.
     pub iris_code: String,
-    /// The mask code.
+    /// The Iris mask code.
     pub mask_code: String,
     /// The Iris code version.
     pub iris_code_version: String,
@@ -84,6 +92,8 @@ pub struct EstimateOutput {
     pub metadata: Metadata,
     /// The Iris normalized image.
     pub normalized_image: Option<NormalizedIris>,
+    /// The Iris resized normalized image.
+    pub normalized_image_resized: Option<NormalizedIris>,
 }
 
 impl TryFrom<PipelineOutput> for EstimateOutput {
@@ -91,12 +101,28 @@ impl TryFrom<PipelineOutput> for EstimateOutput {
 
     fn try_from(output: PipelineOutput) -> std::result::Result<Self, Self::Error> {
         if let Some(iris_template) = output.iris_template {
+            let iris_code = IrisCodeArray::from_base64(&iris_template.iris_codes)?;
+            let mask_code = IrisCodeArray::from_base64(&iris_template.mask_codes)?;
+
+            let iris_code_shares = GaloisRingIrisCodeShare::encode_iris_code(
+                &iris_code,
+                &mask_code,
+                &mut rand::thread_rng(),
+            )
+            .map(|x| x.to_base64());
+            let mask_code_shares =
+                GaloisRingIrisCodeShare::encode_mask_code(&mask_code, &mut rand::thread_rng())
+                    .map(|x| x.to_base64());
+
             Ok(EstimateOutput {
+                iris_code_shares,
+                mask_code_shares,
                 iris_code: iris_template.iris_codes,
                 mask_code: iris_template.mask_codes,
                 iris_code_version: iris_template.iris_code_version,
                 metadata: output.metadata,
                 normalized_image: output.normalized_image,
+                normalized_image_resized: output.normalized_image_resized,
             })
         } else {
             Err(output.error.expect("error not to be None"))
@@ -113,12 +139,12 @@ impl Port for Model {
 }
 
 impl SharedPort for Model {
-    const SERIALIZED_CONFIG_EXTRA_SIZE: usize = 16384 * 20;
+    const SERIALIZED_INIT_SIZE: usize = 16384 * 20;
     const SERIALIZED_INPUT_SIZE: usize = 4096 + IR_HEIGHT as usize * IR_WIDTH as usize;
     const SERIALIZED_OUTPUT_SIZE: usize = 4096 + 16 * 200 * 2 * 2;
 }
 
-impl super::Agent for Model {
+impl agentwire::Agent for Model {
     const NAME: &'static str = "iris";
 }
 
@@ -138,14 +164,13 @@ impl super::Environment<Model> for Environment<'_> {
             ArchivedInput::Version => ("version", Ok(Output::Version(self.version.clone()))),
         };
 
-        DATADOG
-            .timing(
-                format!("orb.main.time.processing.{}.{}", Model::DD_NS, op),
-                inst_elapsed!(t),
-                NO_TAGS,
-            )
-            .or_log();
-        tracing::info!("Python agent {}::{} <benchmark>: {} ms", Model::NAME, op, inst_elapsed!(t));
+        dd_timing!("main.time.processing" + format!("{}.{}", Model::DD_NS, op), t);
+        tracing::info!(
+            "Python agent {}::{} <benchmark>: {} ms",
+            Model::NAME,
+            op,
+            t.elapsed().as_millis()
+        );
 
         res.or_else(|e| {
             if let Some(pe) = e.downcast_ref::<PyErr>() {
@@ -184,6 +209,8 @@ impl Environment<'_> {
             .try_into()?;
 
         log_iris_data(
+            &output.iris_code_shares,
+            &output.mask_code_shares,
             &output.iris_code,
             &output.mask_code,
             &output.iris_code_version,
@@ -196,7 +223,7 @@ impl Environment<'_> {
 
 impl super::AgentPython for Model {
     const DD_NS: &'static str = "iris";
-    const MINIMUM_MODEL_VERSION: &'static str = "1.6.1";
+    const MINIMUM_MODEL_VERSION: &'static str = "1.7.4";
 
     fn init<'py>(self, py: Python<'py>) -> Result<Box<dyn super::Environment<Self> + 'py>> {
         tracing::info!("{} agent: loading model with config: {self:?}", Model::NAME);
@@ -218,16 +245,22 @@ impl super::AgentPython for Model {
         tracing::info!(
             "Python agent {} <benchmark>: initialization done in {} ms",
             Model::NAME,
-            inst_elapsed!(t)
+            t.elapsed().as_millis()
         );
-        DATADOG
-            .timing(
-                format!("orb.main.time.neural_network.init.{}", Model::DD_NS),
-                inst_elapsed!(t),
-                NO_TAGS,
-            )
-            .or_log();
+        dd_timing!("main.time.neural_network.init" + format!("{}", Model::DD_NS), t);
         Ok(Box::new(Environment { agent, version }))
+    }
+}
+
+impl agentwire::agent::Process for Model {
+    type Error = Error;
+
+    fn run(self, port: port::RemoteInner<Self>) -> Result<(), Self::Error> {
+        self.run_python_process(port)
+    }
+
+    fn initializer() -> impl agent::process::Initializer {
+        ProcessInitializer::default()
     }
 }
 

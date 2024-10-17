@@ -5,18 +5,23 @@
 
 use super::FrameResolution;
 use crate::{
+    agents::ProcessInitializer,
     config::Config,
     consts::{CONFIG_DIR, THERMAL_HEIGHT, THERMAL_WIDTH},
-    port,
-    port::{Port, SharedPort},
+    identification,
 };
-use eyre::{Result, WrapErr};
-use orb_seekcamera::Camera;
+use agentwire::{
+    agent,
+    port::{self, Port, SharedPort},
+};
+use eyre::{Error, Result, WrapErr};
+use orb_seekcamera::{Camera, Rotation};
 use png::EncodingError;
 use rkyv::{Archive, Deserialize, Infallible, Serialize};
 use std::{
     env,
     io::prelude::*,
+    mem::size_of,
     ops::Deref,
     sync::Arc,
     time::{Duration, SystemTime},
@@ -57,22 +62,30 @@ impl Port for Sensor {
 }
 
 impl SharedPort for Sensor {
-    const SERIALIZED_CONFIG_EXTRA_SIZE: usize = 0;
+    const SERIALIZED_INIT_SIZE: usize =
+        size_of::<usize>() + size_of::<<Sensor as Archive>::Archived>();
     const SERIALIZED_INPUT_SIZE: usize = 128;
     const SERIALIZED_OUTPUT_SIZE: usize = 128 + THERMAL_HEIGHT as usize * THERMAL_WIDTH as usize;
 }
 
-impl super::Agent for Sensor {
+impl agentwire::Agent for Sensor {
     const NAME: &'static str = "thermal-camera";
 }
 
-impl super::AgentProcess for Sensor {
-    fn run(self, mut port: port::RemoteInner<Self>) -> Result<()> {
+impl agentwire::agent::Process for Sensor {
+    type Error = Error;
+
+    fn run(self, mut port: port::RemoteInner<Self>) -> Result<(), Self::Error> {
         // Default behavior logs to file, we log to stdout/err instead.
         env::set_var("SEEKTHERMAL_LOG_STDOUT", "1");
         env::set_var("SEEKTHERMAL_LOG_STDERR", "1");
         env::set_var("SEEKTHERMAL_ROOT", CONFIG_DIR);
-        let camera = match Camera::attach(self.pairing_status_timeout) {
+        let rotation = if identification::HARDWARE_VERSION.contains("Diamond") {
+            Rotation::CounterClockwise
+        } else {
+            Rotation::Clockwise
+        };
+        let camera = match Camera::attach(self.pairing_status_timeout, rotation) {
             Ok(camera) => camera,
             Err(err) => {
                 tracing::error!("Error connecting to the thermal camera: {err}");
@@ -92,7 +105,7 @@ impl super::AgentProcess for Sensor {
             camera.capture_start()?;
             loop {
                 let frame = camera.recv()?;
-                port.try_send(port::Output::new(Frame(Arc::new(frame))));
+                port.try_send(&port::Output::new(Frame(Arc::new(frame))));
                 if let Some(command) = port.try_recv() {
                     match command.value.deserialize(&mut Infallible).unwrap() {
                         Command::Start => {}
@@ -103,6 +116,10 @@ impl super::AgentProcess for Sensor {
             }
             camera.capture_stop()?;
         }
+    }
+
+    fn initializer() -> impl agent::process::Initializer {
+        ProcessInitializer::default()
     }
 }
 
@@ -148,6 +165,10 @@ impl super::Frame for Frame {
         let mut writer = encoder.write_header()?;
         writer.write_image_data(&self.0)?;
         Ok(())
+    }
+
+    fn as_bytes(&self) -> &[u8] {
+        self.0.data()
     }
 
     fn timestamp(&self) -> Duration {

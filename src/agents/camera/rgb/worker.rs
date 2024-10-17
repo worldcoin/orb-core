@@ -4,17 +4,20 @@
 
 use crate::{
     agents::{
-        camera::{self, FrameResolution},
-        Agent, AgentProcess, AgentProcessExitStrategy,
+        camera::{self, Frame as _, FrameResolution},
+        ProcessInitializer,
     },
     consts::{
         RGB_DEFAULT_HEIGHT, RGB_DEFAULT_WIDTH, RGB_EXPOSURE_RANGE, RGB_FPS, RGB_NATIVE_HEIGHT,
         RGB_NATIVE_WIDTH, RGB_REDUCED_HEIGHT, RGB_REDUCED_WIDTH,
     },
-    fisheye::{self, Fisheye},
+    image::fisheye::{self, Fisheye},
+};
+use agentwire::{
+    agent,
     port::{self, Port, RemoteInner, SharedPort},
 };
-use eyre::{bail, eyre, Result, WrapErr};
+use eyre::{bail, eyre, Error, Result, WrapErr};
 use gstreamer::{
     buffer::{MappedBuffer, Readable},
     prelude::*,
@@ -28,12 +31,16 @@ use opencv::{
     prelude::*,
 };
 use png::EncodingError;
-use rkyv::{Archive, Deserialize, Infallible, Serialize};
+use rkyv::{
+    ser::Serializer,
+    vec::{ArchivedVec, RawArchivedVec, VecResolver},
+    Archive, Deserialize, Fallible, Infallible, Serialize,
+};
 use std::{
     fmt,
     io::prelude::*,
-    mem,
-    ops::Deref,
+    mem::{size_of, take},
+    ptr::copy_nonoverlapping,
     slice,
     sync::Arc,
     time::{Duration, Instant, SystemTime},
@@ -49,17 +56,22 @@ pub struct Worker;
 /// cheap.
 #[derive(Clone, Archive, Serialize, Deserialize)]
 pub struct Frame {
-    data: Arc<Vec<u8>>,
+    data: Arc<FrameData>,
     timestamp: Duration,
     width: u32,
     height: u32,
+}
+
+enum FrameData {
+    Owned(Vec<u8>),
+    Mapped(MappedBuffer<Readable>),
 }
 
 /// RGB camera command.
 #[derive(Debug, Archive, Serialize, Deserialize)]
 pub enum Command {
     /// Play the pipeline.
-    Play,
+    Play(u32),
     /// Pause the pipeline. Some frames can be leaked into the next playing
     /// state.
     Pause,
@@ -84,26 +96,30 @@ impl Port for Worker {
 }
 
 impl SharedPort for Worker {
-    const SERIALIZED_CONFIG_EXTRA_SIZE: usize = 0;
+    const SERIALIZED_INIT_SIZE: usize =
+        size_of::<usize>() + size_of::<<Worker as Archive>::Archived>();
     const SERIALIZED_INPUT_SIZE: usize = 4096;
     const SERIALIZED_OUTPUT_SIZE: usize =
         4096 + RGB_NATIVE_HEIGHT as usize * RGB_NATIVE_WIDTH as usize * 3;
 }
 
-impl Agent for Worker {
+impl agentwire::Agent for Worker {
     const NAME: &'static str = "rgb-camera-worker";
 }
 
-impl AgentProcess for Worker {
-    fn run(self, mut port: RemoteInner<Self>) -> Result<()> {
+impl agentwire::agent::Process for Worker {
+    type Error = Error;
+
+    fn run(self, mut port: RemoteInner<Self>) -> Result<(), Self::Error> {
         let mut undistortion_enabled = false;
         let mut fisheye = apply_fisheye_config(fisheye::Config::default())?;
-        let stream = Stream::new()?;
+        let mut prev_fps = RGB_FPS;
+        let mut stream = Stream::new(prev_fps)?;
         'outer: loop {
-            loop {
+            let fps = loop {
                 match port.recv().value.deserialize(&mut Infallible).unwrap() {
-                    Command::Play => {
-                        break;
+                    Command::Play(fps) => {
+                        break fps;
                     }
                     Command::Pause => {
                         bail!("gstreamer pipeline is not playing")
@@ -120,6 +136,10 @@ impl AgentProcess for Worker {
                         undistortion_enabled = false;
                     }
                 }
+            };
+            if fps != prev_fps {
+                stream = Stream::new(fps)?;
+                prev_fps = fps;
             }
             stream.pipeline.set_state(gstreamer::State::Playing)?;
             let mut errors_count = 0;
@@ -139,14 +159,14 @@ impl AgentProcess for Worker {
                             .into_mapped_buffer_readable()
                             .map_err(|_| eyre!("unable to obtain readable mapped buffer"))?;
                         let mut frame =
-                            Frame::new(&data, timestamp, RGB_NATIVE_WIDTH, RGB_NATIVE_HEIGHT);
+                            Frame::new(data, timestamp, RGB_NATIVE_WIDTH, RGB_NATIVE_HEIGHT);
                         if undistortion_enabled {
                             frame.undistort(&fisheye)?;
                         }
-                        port.try_send(port::Output { value: frame, source_ts });
+                        port.try_send(&port::Output { value: frame, source_ts });
                         if let Some(command) = port.try_recv() {
                             match command.value.deserialize(&mut Infallible).unwrap() {
-                                Command::Reset | Command::Play => {
+                                Command::Reset | Command::Play(_) => {
                                     bail!("gstreamer pipeline is playing")
                                 }
                                 Command::Pause => {
@@ -165,7 +185,7 @@ impl AgentProcess for Worker {
                     Err(err) => {
                         tracing::error!("Failed to pull sample from GStreamer: {err:?}");
                         errors_count += 1;
-                        if errors_count > 100 {
+                        if errors_count > 50 {
                             break 'outer;
                         }
                     }
@@ -176,10 +196,14 @@ impl AgentProcess for Worker {
         Ok(())
     }
 
-    fn exit_strategy(_code: Option<i32>, _signal: Option<i32>) -> AgentProcessExitStrategy {
+    fn exit_strategy(_code: Option<i32>, _signal: Option<i32>) -> agent::process::ExitStrategy {
         // Always close the port. The top-level RGB camera agent will notice
         // this and run custom recovery logic.
-        AgentProcessExitStrategy::Close
+        agent::process::ExitStrategy::Close
+    }
+
+    fn initializer() -> impl agent::process::Initializer {
+        ProcessInitializer::default()
     }
 }
 
@@ -188,13 +212,13 @@ fn apply_fisheye_config(fisheye_config: fisheye::Config) -> Result<Fisheye> {
 }
 
 impl Stream {
-    fn new() -> Result<Self> {
-        let pipeline = Pipeline::new(Some("rgb-camera"));
+    fn new(fps: u32) -> Result<Self> {
+        let pipeline = Pipeline::with_name("rgb-camera");
         let nvarguscamerasrc = ElementFactory::make("nvarguscamerasrc").build()?;
         let nvvidconv = ElementFactory::make("nvvidconv").build()?;
         let videoconvert = ElementFactory::make("videoconvert").build()?;
         let appsink = AppSink::builder().build();
-        pipeline.add_many(&[&nvarguscamerasrc, &nvvidconv, &videoconvert, appsink.upcast_ref()])?;
+        pipeline.add_many([&nvarguscamerasrc, &nvvidconv, &videoconvert, appsink.upcast_ref()])?;
         nvarguscamerasrc.set_property_from_str(
             "exposuretimerange",
             &format!("{} {}", RGB_EXPOSURE_RANGE.start(), RGB_EXPOSURE_RANGE.end()),
@@ -206,10 +230,12 @@ impl Stream {
                 .field("width", i32::try_from(RGB_NATIVE_WIDTH)?)
                 .field("height", i32::try_from(RGB_NATIVE_HEIGHT)?)
                 .field("format", "NV12")
-                .field("framerate", Fraction::new(RGB_FPS.try_into()?, 1))
+                .field("framerate", Fraction::new(fps.try_into()?, 1))
                 .build(),
         )?;
+
         nvvidconv.set_property_from_str("flip-method", "3");
+
         nvvidconv.link_filtered(
             &videoconvert,
             &Caps::builder("video/x-raw")
@@ -246,7 +272,7 @@ impl camera::Frame for Frame {
         let mut writer = encoder.write_header()?;
         let mut writer = writer.stream_writer();
         unsafe {
-            let mut ptr = self.data.as_ptr();
+            let mut ptr = self.as_bytes().as_ptr();
             for _ in 0..png_height {
                 for _ in 0..png_width {
                     let r = *ptr;
@@ -262,6 +288,10 @@ impl camera::Frame for Frame {
         }
         writer.finish()?;
         Ok(())
+    }
+
+    fn as_bytes(&self) -> &[u8] {
+        self.data.as_slice()
     }
 
     fn timestamp(&self) -> Duration {
@@ -280,19 +310,14 @@ impl camera::Frame for Frame {
 impl Frame {
     /// Creates a new frame.
     #[must_use]
-    pub fn new(
-        data: &MappedBuffer<Readable>,
-        timestamp: Duration,
-        width: u32,
-        height: u32,
-    ) -> Self {
-        Self { data: Arc::new(data.to_vec()), timestamp, width, height }
+    pub fn new(data: MappedBuffer<Readable>, timestamp: Duration, width: u32, height: u32) -> Self {
+        Self { data: Arc::new(FrameData::Mapped(data)), timestamp, width, height }
     }
 
     /// Creates a new frame from a vector.
     #[must_use]
     pub fn from_vec(data: Vec<u8>, timestamp: Duration, width: u32, height: u32) -> Self {
-        Self { data: Arc::new(data), timestamp, width, height }
+        Self { data: Arc::new(FrameData::Owned(data)), timestamp, width, height }
     }
 
     /// Decodes a PNG image into a frame.
@@ -302,7 +327,7 @@ impl Frame {
         let mut buf = vec![0; info.buffer_size()];
         reader.next_frame(&mut buf)?;
         Ok(Self {
-            data: Arc::new(buf),
+            data: Arc::new(FrameData::Owned(buf)),
             timestamp: SystemTime::UNIX_EPOCH.elapsed().unwrap_or(Duration::MAX),
             width: info.width,
             height: info.height,
@@ -313,27 +338,31 @@ impl Frame {
         assert_eq!(self.width, RGB_NATIVE_WIDTH);
         assert_eq!(self.height, RGB_NATIVE_HEIGHT);
         if fisheye.rgb_width == RGB_REDUCED_WIDTH && fisheye.rgb_height == RGB_REDUCED_HEIGHT {
-            self.data = Arc::new(unsafe { native_to_reduced(&self.data) });
+            self.data = Arc::new(FrameData::Owned(unsafe { native_to_reduced(self.as_bytes()) }));
             self.width = RGB_REDUCED_WIDTH;
             self.height = RGB_REDUCED_HEIGHT;
         } else if fisheye.rgb_width == RGB_DEFAULT_WIDTH && fisheye.rgb_height == RGB_DEFAULT_HEIGHT
         {
-            self.data = Arc::new(unsafe { native_to_default(&self.data) });
+            self.data = Arc::new(FrameData::Owned(unsafe { native_to_default(self.as_bytes()) }));
             self.width = RGB_DEFAULT_WIDTH;
             self.height = RGB_DEFAULT_HEIGHT;
         }
-        let data = mem::take(&mut self.data);
+        let data = take(&mut self.data);
         let width = self.width;
         let height = self.height;
-        self.data = Arc::new(fisheye.undistort_image(&data, width, height)?);
+        self.data =
+            Arc::new(FrameData::Owned(fisheye.undistort_image(data.as_slice(), width, height)?));
         Ok(())
     }
 
     /// Converts this frame into an owned 3-dimensional array.
     #[must_use]
     pub fn into_ndarray(&self) -> Array3<u8> {
-        Array::from_shape_vec((self.height as usize, self.width as usize, 3), (*self.data).clone())
-            .unwrap()
+        Array::from_shape_vec(
+            (self.height as usize, self.width as usize, 3),
+            self.as_bytes().to_vec(),
+        )
+        .unwrap()
     }
 
     /// Resize the frame in place by given fraction.
@@ -344,7 +373,7 @@ impl Frame {
                 self.height as i32,
                 self.width as i32,
                 CV_8UC3,
-                self.data.as_slice().as_ptr() as *mut _,
+                self.as_bytes().as_ptr() as *mut _,
                 Mat_AUTO_STEP,
             )?
         };
@@ -358,7 +387,7 @@ impl Frame {
             .product();
         let ptr = dst.ptr(0)?.cast::<u8>();
         let slice = unsafe { slice::from_raw_parts(ptr, len) };
-        self.data = Arc::new(slice.to_vec());
+        self.data = Arc::new(FrameData::Owned(slice.to_vec()));
         self.height = dst.rows() as u32;
         self.width = dst.cols() as u32;
         Ok(())
@@ -368,8 +397,9 @@ impl Frame {
 impl ArchivedFrame {
     /// Converts this frame into an owned 3-dimensional array.
     pub fn into_ndarray(&self) -> Array3<u8> {
-        let vec = (*self.data).deserialize(&mut Infallible).unwrap();
-        Array::from_shape_vec((self.height as usize, self.width as usize, 3), vec).unwrap()
+        let data = (*self.data).deserialize(&mut Infallible).unwrap();
+        let FrameData::Owned(data) = data else { panic!("deserialized into a non-owned variant") };
+        Array::from_shape_vec((self.height as usize, self.width as usize, 3), data).unwrap()
     }
 
     /// Returns frame width.
@@ -391,18 +421,10 @@ impl ArchivedFrame {
     }
 }
 
-impl Deref for Frame {
-    type Target = [u8];
-
-    fn deref(&self) -> &Self::Target {
-        &self.data
-    }
-}
-
 impl Default for Frame {
     fn default() -> Self {
         Self {
-            data: Arc::new(vec![0; RGB_DEFAULT_WIDTH as usize * RGB_DEFAULT_HEIGHT as usize * 3]),
+            data: Arc::new(FrameData::default()),
             timestamp: Duration::default(),
             width: RGB_DEFAULT_WIDTH,
             height: RGB_DEFAULT_HEIGHT,
@@ -417,6 +439,53 @@ impl fmt::Debug for Frame {
             .field("width", &self.width)
             .field("height", &self.height)
             .finish_non_exhaustive()
+    }
+}
+
+impl FrameData {
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            Self::Owned(data) => data.as_slice(),
+            Self::Mapped(data) => data.as_slice(),
+        }
+    }
+}
+
+impl Default for FrameData {
+    fn default() -> Self {
+        Self::Owned(vec![0; RGB_DEFAULT_WIDTH as usize * RGB_DEFAULT_HEIGHT as usize * 3])
+    }
+}
+
+impl Archive for FrameData {
+    type Archived = RawArchivedVec<u8>;
+    type Resolver = VecResolver;
+
+    unsafe fn resolve(&self, pos: usize, resolver: Self::Resolver, out: *mut Self::Archived) {
+        unsafe { RawArchivedVec::resolve_from_slice(self.as_slice(), pos, resolver, out) };
+    }
+}
+
+impl<S> Serialize<S> for FrameData
+where
+    S: Serializer,
+{
+    fn serialize(&self, serializer: &mut S) -> Result<Self::Resolver, S::Error> {
+        unsafe { ArchivedVec::serialize_copy_from_slice(self.as_slice(), serializer) }
+    }
+}
+
+impl<D> Deserialize<FrameData, D> for RawArchivedVec<u8>
+where
+    D: Fallible + ?Sized,
+{
+    fn deserialize(&self, _: &mut D) -> Result<FrameData, D::Error> {
+        let mut result = Vec::with_capacity(self.len());
+        unsafe {
+            copy_nonoverlapping(self.as_ptr().cast(), result.as_mut_ptr(), self.len());
+            result.set_len(self.len());
+        }
+        Ok(FrameData::Owned(result))
     }
 }
 

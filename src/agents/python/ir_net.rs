@@ -4,19 +4,20 @@
 
 use crate::{
     agents::{
-        camera,
-        camera::Frame,
+        camera::{self, Frame},
         python::{check_model_version, choose_config, AgentPython},
-        Agent,
+        ProcessInitializer,
     },
     config::Config,
     consts::{IR_HEIGHT, IR_WIDTH},
-    inst_elapsed,
-    logger::{LogOnError, DATADOG, NO_TAGS},
-    port::{Port, SharedPort},
+    dd_gauge, dd_incr, dd_timing,
     utils::RkyvNdarray,
 };
-use eyre::Result;
+use agentwire::{
+    agent::{self, Agent as _},
+    port::{self, Port, SharedPort},
+};
+use eyre::{Error, Result};
 use ndarray::prelude::*;
 use numpy::PyArray2;
 use orb_ir_net::IrNet;
@@ -43,7 +44,7 @@ pub enum Input {
         frame: camera::ir::Frame,
         /// Physioligical side of eye IR-Net should currently target.
         target_left_eye: bool,
-        /// Focus on a matrix of QR codes.
+        /// Focus on a matrix of Aruco codes.
         focus_matrix_code: bool,
     },
     /// Get IR-Net version.
@@ -129,12 +130,12 @@ impl Port for Model {
 }
 
 impl SharedPort for Model {
-    const SERIALIZED_CONFIG_EXTRA_SIZE: usize = 4096;
+    const SERIALIZED_INIT_SIZE: usize = 4096;
     const SERIALIZED_INPUT_SIZE: usize = 4096 + IR_HEIGHT as usize * IR_WIDTH as usize;
     const SERIALIZED_OUTPUT_SIZE: usize = 4096;
 }
 
-impl Agent for Model {
+impl agentwire::Agent for Model {
     const NAME: &'static str = "ir-net";
 }
 
@@ -152,18 +153,12 @@ impl super::Environment<Model> for Environment<'_> {
             ArchivedInput::Warmup => ("warmup", self.warmup(py).map(|()| Output::Warmup)),
         };
 
-        DATADOG
-            .timing(
-                format!("orb.main.time.processing.{}.{}", Model::DD_NS, op),
-                inst_elapsed!(t),
-                NO_TAGS,
-            )
-            .or_log();
+        dd_timing!("main.time.processing" + format!("{}.{}", Model::DD_NS, op), t);
         tracing::trace!(
             "Python agent {}::{} <benchmark>: {} ms",
             Model::NAME,
             op,
-            inst_elapsed!(t)
+            t.elapsed().as_millis()
         );
 
         res.or_else(|e| {
@@ -216,16 +211,22 @@ impl super::AgentPython for Model {
         tracing::info!(
             "Python agent {} <benchmark>: initialization done in {} ms",
             Model::NAME,
-            inst_elapsed!(t)
+            t.elapsed().as_millis()
         );
-        DATADOG
-            .timing(
-                format!("orb.main.time.neural_network.init.{}", Model::DD_NS),
-                inst_elapsed!(t),
-                NO_TAGS,
-            )
-            .or_log();
+        dd_timing!("main.time.neural_network.init" + format!("{}", Model::DD_NS), t);
         Ok(Box::new(Environment { ir_net, version }))
+    }
+}
+
+impl agentwire::agent::Process for Model {
+    type Error = Error;
+
+    fn run(self, port: port::RemoteInner<Self>) -> Result<(), Self::Error> {
+        self.run_python_process(port)
+    }
+
+    fn initializer() -> impl agent::process::Initializer {
+        ProcessInitializer::default()
     }
 }
 
@@ -290,17 +291,24 @@ pub fn extract(estimation: &PyAny) -> Result<EstimateOutput> {
         perceived_side,
     };
 
-    estimate.log()?;
+    estimate.log();
 
     Ok(estimate)
 }
 
+#[cfg(feature = "integration_testing")]
+fn calculate_selection_score(sharpness: f64, _valid_for_identification: bool, status: i64) -> f64 {
+    // status 11 represents incorrect eye orientation
+    if sharpness.is_nan() || status == 11 { -1.0 } else { sharpness }
+}
+
+#[cfg(not(feature = "integration_testing"))]
 fn calculate_selection_score(sharpness: f64, valid_for_identification: bool, status: i64) -> f64 {
     if status != 0 || !valid_for_identification || sharpness.is_nan() { -1.0 } else { sharpness }
 }
 
 impl EstimateOutput {
-    fn log(&self) -> Result<()> {
+    fn log(&self) {
         tracing::trace!(
             "Ir net result: sharpness {:?}, occlusion_30 {:?}, occlusion_90 {:?}, \
              pupil_to_iris_ratio {:?}, valid_for_identification {:?}, status {:?}, score {:?}, \
@@ -314,58 +322,33 @@ impl EstimateOutput {
             self.score,
             self.perceived_side
         );
-        DATADOG.gauge(
-            "orb.main.gauge.neural_network.ir_net.sharpness",
-            self.sharpness.to_string(),
-            NO_TAGS,
-        )?;
-        DATADOG.gauge(
-            "orb.main.gauge.neural_network.ir_net.occlusion_30",
-            self.occlusion_30.to_string(),
-            NO_TAGS,
-        )?;
-        DATADOG.gauge(
-            "orb.main.gauge.neural_network.ir_net.occlusion_90",
-            self.occlusion_90.to_string(),
-            NO_TAGS,
-        )?;
-        DATADOG.gauge(
-            "orb.main.gauge.neural_network.ir_net.pupil_to_iris_ratio",
-            self.pupil_to_iris_ratio.to_string(),
-            NO_TAGS,
-        )?;
+        dd_gauge!("main.gauge.neural_network.ir_net.sharpness", self.sharpness.to_string());
+        dd_gauge!("main.gauge.neural_network.ir_net.occlusion_30", self.occlusion_30.to_string());
+        dd_gauge!("main.gauge.neural_network.ir_net.occlusion_90", self.occlusion_90.to_string());
+        dd_gauge!(
+            "main.gauge.neural_network.ir_net.pupil_to_iris_ratio",
+            self.pupil_to_iris_ratio.to_string()
+        );
         if self.valid_for_identification {
-            DATADOG.incr(
-                "orb.main.count.neural_network.ir_net.valid_for_identification.valid",
-                NO_TAGS,
-            )?;
+            dd_incr!("main.count.neural_network.ir_net.valid_for_identification.valid");
         } else {
-            DATADOG.incr(
-                "orb.main.count.neural_network.ir_net.valid_for_identification.invalid",
-                NO_TAGS,
-            )?;
+            dd_incr!("main.count.neural_network.ir_net.valid_for_identification.invalid");
         }
         if self.status == 0 {
-            DATADOG.incr("orb.main.count.neural_network.ir_net.status.valid", NO_TAGS)?;
+            dd_incr!("main.count.neural_network.ir_net.status.valid");
         } else {
-            DATADOG.incr("orb.main.count.neural_network.ir_net.status.invalid", [format!(
-                "status:{}",
-                self.status
-            )])?;
+            dd_incr!(
+                "main.count.neural_network.ir_net.status.invalid",
+                &format!("status:{}", self.status)
+            );
         }
-        DATADOG.gauge(
-            "orb.main.gauge.neural_network.ir_net.score",
-            self.score.to_string(),
-            NO_TAGS,
-        )?;
+        dd_gauge!("main.gauge.neural_network.ir_net.score", self.score.to_string());
         if let Some(perceived_side) = self.perceived_side {
-            DATADOG.gauge(
-                "orb.main.gauge.neural_network.ir_net.perceived_side",
-                perceived_side.to_string(),
-                NO_TAGS,
-            )?;
+            dd_gauge!(
+                "main.gauge.neural_network.ir_net.perceived_side",
+                perceived_side.to_string()
+            );
         }
-        Ok(())
     }
 }
 

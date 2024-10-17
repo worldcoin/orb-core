@@ -2,7 +2,7 @@
 , python38
 , stdenv
 , iris
-# , rgb-net # FOSS
+, rgb-net
 }:
 
 let
@@ -26,22 +26,129 @@ let
       doCheck = false;
     };
 
-    # rgbnetPkg = self.buildPythonPackage {
-    #   name = "rgb-net";
-    #   src = rgb-net;
-    #   RGBNET_ENV = "SERVER";
-    #   propagatedBuildInputs = with self; [
-    #     opencv4
-    #     numpy
-    #     onnxruntime
-    #   ];
-    #   patchPhase = ''
-    #     sed -i 's/opencv-python\([^0-9]\+\)4\.7\.0\(\.[0-9]\+\)\?/opencv\14.7.0/' requirements/*.txt pyproject.toml
-    #   '';
-    #   doCheck = false;
-    # };
+    rgbnetPkg = self.buildPythonPackage {
+      name = "rgb-net";
+      src = rgb-net;
+      RGBNET_ENV = "SERVER";
+      propagatedBuildInputs = with self; [
+        opencv4
+        numpy
+        onnxruntime
+      ];
+      patchPhase = ''
+        sed -i 's/opencv-python\([^0-9]\+\)4\.7\.0\(\.[0-9]\+\)\?/opencv\14.7.0/' requirements/*.txt pyproject.toml
+      '';
+      doCheck = false;
+    };
 
     opencv4 = super.opencv4.override { enablePython = true; pythonPackages = self; };
+
+    sphinx = self.buildPythonPackage rec {
+      pname = "sphinx";
+      version = "5.3.0";
+      format = "wheel";
+      src = self.fetchPypi ({
+        inherit pname version;
+        format = "wheel";
+        platform = "any";
+        dist = "py3";
+        python = "py3";
+        abi = "none";
+        hash = "sha256-Bgylyfe6V6CKEhnlR7Jp+t8SWuJbBrn6f2Z2jvtlLW0=";
+      });
+      propagatedBuildInputs = with self; [
+        alabaster
+        babel
+        docutils
+        imagesize
+        jinja2
+        packaging
+        pygments
+        requests
+        setuptools
+        snowballstemmer
+        sphinxcontrib-applehelp
+        sphinxcontrib-devhelp
+        sphinxcontrib-htmlhelp
+        sphinxcontrib-qthelp
+        sphinxcontrib-serializinghtml
+      ];
+    };
+
+    sphinxcontrib-applehelp = self.buildPythonPackage rec {
+      pname = "sphinxcontrib_applehelp";
+      version = "1.0.2";
+      format = "wheel";
+      src = self.fetchPypi ({
+        inherit pname version;
+        format = "wheel";
+        platform = "any";
+        dist = "py2.py3";
+        python = "py2.py3";
+        abi = "none";
+        hash = "sha256-gGER5elivpfCnsTB5/4ne/0Z6WUvsaQ5IQW0PgGviFo=";
+      });
+    };
+
+    sphinxcontrib-devhelp = self.buildPythonPackage rec {
+      pname = "sphinxcontrib_devhelp";
+      version = "1.0.2";
+      format = "wheel";
+      src = self.fetchPypi ({
+        inherit pname version;
+        format = "wheel";
+        platform = "any";
+        dist = "py2.py3";
+        python = "py2.py3";
+        abi = "none";
+        hash = "sha256-gWUiP5ozXMGvf/4e0x0ocfMlJUwEI7wMTHzRweRzSi4=";
+      });
+    };
+
+    sphinxcontrib-htmlhelp = self.buildPythonPackage rec {
+      pname = "sphinxcontrib_htmlhelp";
+      version = "2.0.0";
+      format = "wheel";
+      src = self.fetchPypi ({
+        inherit pname version;
+        format = "wheel";
+        platform = "any";
+        dist = "py2.py3";
+        python = "py2.py3";
+        abi = "none";
+        hash = "sha256-1BIkPft5euPsK1nsoOUtrBLnWiQb8OTrhh5FDQbG7Qc=";
+      });
+    };
+
+    sphinxcontrib-qthelp = self.buildPythonPackage rec {
+      pname = "sphinxcontrib_qthelp";
+      version = "1.0.3";
+      format = "wheel";
+      src = self.fetchPypi ({
+        inherit pname version;
+        format = "wheel";
+        platform = "any";
+        dist = "py2.py3";
+        python = "py2.py3";
+        abi = "none";
+        hash = "sha256-vZ/CS8t0io1R/U7KreaBNQqmMAmjR6jBTmN4lURN+rY=";
+      });
+    };
+
+    sphinxcontrib-serializinghtml = self.buildPythonPackage rec {
+      pname = "sphinxcontrib_serializinghtml";
+      version = "1.1.5";
+      format = "wheel";
+      src = self.fetchPypi ({
+        inherit pname version;
+        format = "wheel";
+        platform = "any";
+        dist = "py2.py3";
+        python = "py2.py3";
+        abi = "none";
+        hash = "sha256-NSqaAK6GRHHTp+rY19efX8C1fos/lemGfrnrKJmbkv0=";
+      });
+    };
 
     numpy = self.buildPythonPackage rec {
       pname = "numpy";
@@ -160,5 +267,5 @@ in
 (python38.override { inherit packageOverrides; }).withPackages (ps: with ps; [
   pip
   irisPkg
-  # rgbnetPkg # FOSS
+  rgbnetPkg
 ])

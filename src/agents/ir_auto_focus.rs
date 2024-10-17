@@ -5,11 +5,9 @@ use crate::{
     consts::{AUTOFOCUS_MAX, AUTOFOCUS_MIN, IR_FOCUS_RANGE},
     dsp::Lagging,
     pid::{derivative::LowPassFilter, InstantTimer, Pid, Timer},
-    port,
-    port::Port,
 };
-use async_trait::async_trait;
-use eyre::Result;
+use agentwire::port::{self, Port};
+use eyre::{Error, Result};
 use futures::prelude::*;
 use ndarray::prelude::*;
 use std::{ops::RangeInclusive, time::Instant};
@@ -77,13 +75,14 @@ impl Port for Agent {
     const OUTPUT_CAPACITY: usize = 0;
 }
 
-impl super::Agent for Agent {
+impl agentwire::Agent for Agent {
     const NAME: &'static str = "ir-auto-focus";
 }
 
-#[async_trait]
-impl super::AgentTask for Agent {
-    async fn run(mut self, mut port: port::Inner<Self>) -> Result<()> {
+impl agentwire::agent::Task for Agent {
+    type Error = Error;
+
+    async fn run(self, mut port: port::Inner<Self>) -> Result<(), Self::Error> {
         'reset: loop {
             let start_timestamp = Instant::now();
             let mut update_counter: u64 = 0;

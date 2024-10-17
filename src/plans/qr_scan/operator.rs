@@ -1,7 +1,7 @@
 //! Operator QR-code scanning.
 
 use super::{user, Schema};
-use crate::{led, sound, sound::Voice};
+use crate::ui;
 use once_cell::sync::Lazy;
 use regex::Regex;
 
@@ -33,16 +33,16 @@ pub enum Data {
 }
 
 impl Schema for Data {
-    fn sound() -> sound::Type {
-        sound::Type::Voice(Voice::Silence)
-    }
-
-    fn led() -> led::QrScanSchema {
-        led::QrScanSchema::Operator
+    fn ui() -> ui::QrScanSchema {
+        ui::QrScanSchema::Operator
     }
 
     fn try_parse(code: &str) -> Option<Self> {
-        let normal = user::Data::try_parse(code).map(Data::Normal);
+        let normal = user::Data::try_parse(code)
+            .filter(
+                |d| if d.signup_extension() { d.signup_extension_config.is_some() } else { true },
+            )
+            .map(Data::Normal);
         if normal.is_some() {
             return normal;
         }

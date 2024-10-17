@@ -6,11 +6,9 @@ use crate::{
         DEFAULT_IR_LED_DURATION, IR_CAMERA_DEFAULT_GAIN, IR_LED_MAX_DURATION, IR_LED_MIN_DURATION,
     },
     pid::{InstantTimer, Pid, Timer},
-    port,
-    port::Port,
 };
-use async_trait::async_trait;
-use eyre::Result;
+use agentwire::port::{self, Port};
+use eyre::{Error, Result};
 use futures::prelude::*;
 use std::ops::RangeInclusive;
 
@@ -60,13 +58,14 @@ impl Port for Agent {
     const OUTPUT_CAPACITY: usize = 0;
 }
 
-impl super::Agent for Agent {
+impl agentwire::Agent for Agent {
     const NAME: &'static str = "ir-auto-exposure";
 }
 
-#[async_trait]
-impl super::AgentTask for Agent {
-    async fn run(self, mut port: port::Inner<Self>) -> Result<()> {
+impl agentwire::agent::Task for Agent {
+    type Error = Error;
+
+    async fn run(self, mut port: port::Inner<Self>) -> Result<(), Self::Error> {
         let mut timer = InstantTimer::default();
         #[allow(clippy::cast_precision_loss)]
         let mut controller = ExposureController::new(

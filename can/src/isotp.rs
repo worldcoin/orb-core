@@ -33,7 +33,7 @@ const CAN_ISOTP_LL_OPTIONS_SIZE: usize = mem::size_of::<CanIsotpLlOptions>();
 pub struct CanIsotpOptions {
     /// Set flags for isotp behaviour.
     flags: u32,
-    /// Frame transmission time (N_As/N_Ar) time in nano secs.
+    /// Frame transmission time (`N_As/N_Ar`) time in nano secs.
     frame_txtime: u32,
     /// Set address for extended addressing.
     ext_address: u8,
@@ -63,7 +63,7 @@ pub struct CanIsotpLlOptions {
     mtu: u8,
     /// Tx link layer data length in bytes (configured maximum payload length).
     tx_dl: u8,
-    /// Set into struct canfd_frame.flags at frame creation.
+    /// Set into struct `canfd_frame.flags` at frame creation.
     tx_flags: u8,
 }
 

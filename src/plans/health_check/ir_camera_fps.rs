@@ -2,9 +2,9 @@
 
 use crate::{
     agents::camera,
-    brokers::{BrokerFlow, Orb, OrbPlan},
-    port,
+    brokers::{Orb, OrbPlan},
 };
+use agentwire::{port, BrokerFlow};
 use eyre::Result;
 use futures::prelude::*;
 use std::{
@@ -60,6 +60,7 @@ impl Plan {
     /// Runs the IR camera FPS check plan.
     pub async fn run(&mut self, orb: &mut Orb) -> Result<bool> {
         tracing::info!("IR camera FPS check: running");
+
         orb.start_ir_eye_camera().await?;
         orb.start_ir_face_camera().await?;
         orb.run(self).await?;

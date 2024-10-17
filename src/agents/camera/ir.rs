@@ -32,13 +32,13 @@ use crate::{
         IR_CAMERA_DEFAULT_BLACK_LEVEL, IR_CAMERA_DEFAULT_EXPOSURE, IR_CAMERA_DEFAULT_GAIN,
         IR_HEIGHT, IR_WIDTH,
     },
+    dd_gauge, dd_incr, dd_timing,
     ext::mpsc::SenderExt as _,
-    logger::{LogOnError, DATADOG, NO_TAGS},
-    poll_commands, port,
-    port::Port,
+    poll_commands,
     time_series::TimeSeries,
 };
-use eyre::{ensure, Result, WrapErr};
+use agentwire::port::{self, Port};
+use eyre::{ensure, Error, Result, WrapErr};
 use futures::{
     channel::{mpsc, oneshot},
     prelude::*,
@@ -48,7 +48,6 @@ use orb_camera::{Buffer, Device, Format};
 use png::EncodingError;
 use rkyv::{Archive, Deserialize, Infallible, Serialize};
 use std::{
-    convert::TryInto,
     fmt,
     io::prelude::*,
     ops::Deref,
@@ -72,20 +71,34 @@ const TRIGGER_MODE: i64 = 1; // mode 0: free run | mode 1: external trigger
 pub struct Sensor {
     state_tx: Option<mpsc::Sender<super::State>>,
     device_path: &'static str,
+    capturing: bool,
     rotation: bool,
+    flip: bool,
 }
 
 impl Sensor {
     /// Initializes IR Eye Camera Sensor mounted in the back of the Orb.
     #[must_use]
     pub fn eye(state_tx: Option<mpsc::Sender<super::State>>) -> Self {
-        Self { state_tx, device_path: EYE_DEVICE_PATH, rotation: false }
+        Self {
+            state_tx,
+            device_path: EYE_DEVICE_PATH,
+            capturing: false,
+            rotation: false,
+            flip: false,
+        }
     }
 
     /// Initializes IR Face Camera Sensor mounted in the front of the Orb.
     #[must_use]
     pub fn face(state_tx: Option<mpsc::Sender<super::State>>) -> Self {
-        Self { state_tx, device_path: FACE_DEVICE_PATH, rotation: true }
+        Self {
+            state_tx,
+            device_path: FACE_DEVICE_PATH,
+            capturing: false,
+            rotation: true,
+            flip: false,
+        }
     }
 }
 
@@ -146,166 +159,168 @@ impl Port for Sensor {
     const OUTPUT_CAPACITY: usize = 0;
 }
 
-impl super::Agent for Sensor {
+impl agentwire::Agent for Sensor {
     const NAME: &'static str = "ir-camera";
 }
 
-impl super::AgentThread for Sensor {
-    #[allow(clippy::too_many_lines)]
-    fn run(mut self, mut port: port::Inner<Self>) -> Result<()> {
-        let mut restart = false;
-        let mut flip = false;
-        let mut exit = false;
-        let mut scratch_buffer = Vec::<u16>::with_capacity((IR_WIDTH * IR_HEIGHT) as usize);
-        while !exit {
-            let sensor = Device::open(self.device_path)?;
-            let mut format = sensor.format()?;
-            format.pixel_format = PIX_FMT;
-            format = sensor.set_format(&format)?;
-            ensure!(format.pixel_format == PIX_FMT, "couldn't set pixel format");
-            sensor.set_control("Trigger Mode", TRIGGER_MODE)?;
-            sensor.set_control("Gain", IR_CAMERA_DEFAULT_GAIN)?;
-            sensor.set_control("Exposure", IR_CAMERA_DEFAULT_EXPOSURE)?;
-            sensor.set_control("Black Level", IR_CAMERA_DEFAULT_BLACK_LEVEL)?;
-            let buf = Buffer::new(&sensor, BUF_COUNT)?;
-            sensor.with_waiter_context(|waiter, cx| {
-                'enable: loop {
-                    if restart {
-                        restart = false;
-                    } else {
-                        'start: loop {
-                            poll_commands! { |port, cx|
-                                Some(Command::SetGain(gain)) => sensor.set_control("Gain", gain)?,
-                                Some(Command::SetExposure(exposure)) => sensor.set_control("Exposure", exposure)?,
-                                Some(Command::SetFlip(new_flip)) => flip = new_flip,
-                                Some(Command::SetBlackLevel(black_level)) => {
-                                    sensor.set_control("Black Level", black_level)?;
-                                }
-                                Some(Command::Start) => break 'start,
-                                None => {
-                                    exit = true;
-                                    break 'enable Ok(());
-                                }
-                            }
-                            waiter.wait_event(SLEEP_TIMEOUT)?;
-                        }
-                    }
+impl agentwire::agent::Thread for Sensor {
+    type Error = Error;
+
+    fn run(mut self, mut port: port::Inner<Self>) -> Result<(), Self::Error> {
+        loop {
+            match self.main_loop(&mut port) {
+                Ok(true) => break,
+                Ok(false) => continue,
+                Err(err) => {
                     if let Some(state_tx) = &mut self.state_tx {
-                        state_tx.send_now(super::State::Capturing)?;
-                    }
-                    for i in 0..buf.count() {
-                        if let Err(err) = buf.enqueue(i) {
-                            if let Some(state_tx) = &mut self.state_tx {
-                                state_tx.send_now(super::State::Error)?;
-                            }
-                            DATADOG.incr("orb.main.count.hardware.camera.issue.ir_camera.initialization_problem_restarting", NO_TAGS).or_log();
-                            tracing::error!("IR camera initialization error: {}. Restarting the camera.", err);
-                            restart = true;
-                            break 'enable Ok(());
-                        }
-                    }
-                    sensor.start()?;
-                    let capture_start_timestamp = Instant::now();
-                    let mut log = Log::default();
-                    let mut frame_counter: u64 = 0;
-                    let mut latest_frame = None;
-                    let mut latest_timestamp = SystemTime::now();
-                    'capture: loop {
-                        poll_commands! { |port, cx|
-                            Some(Command::SetGain(gain)) => {
-                                sensor.set_control("Gain", gain)?;
-                                log.gain.push(gain);
-                            }
-                            Some(Command::SetExposure(exposure)) => {
-                                sensor.set_control("Exposure", exposure)?;
-                                log.exposure.push(exposure);
-                            }
-                            Some(Command::SetFlip(new_flip)) => {
-                                flip = new_flip;
-                            }
-                            Some(Command::Stop(log_tx)) => {
-                                let capture_time = capture_start_timestamp.elapsed().as_secs();
-                                log.fps = if capture_time > 0 {
-                                    frame_counter / capture_time
-                                } else {
-                                    0
-                                };
-                                tracing::info!("FPS of video device {}: {}", self.device_path, log.fps);
-                                #[allow(let_underscore_drop)]
-                                let _ = log_tx.send(log);
-                                if let Some(state_tx) = &mut self.state_tx {
-                                    state_tx.send_now(super::State::Idle)?;
-                                }
-                                break 'capture;
-                            }
-                            Some(Command::SetBlackLevel(black_level)) => {
-                                sensor.set_control("Black Level", black_level)?;
-                            }
-                            None => {
-                                exit = true;
-                                break 'enable Ok(());
-                            },
-                        }
-                        waiter.wait(SLEEP_TIMEOUT)?;
-                        match buf.dequeue() {
-                            Ok(Some(dequeued)) => {
-                                let timestamp = dequeued.timestamp;
-                                latest_frame = Some(PendingFrame::new(
-                                    &buf,
-                                    dequeued.index,
-                                    timestamp,
-                                    &format,
-                                ));
-                                let delay = latest_timestamp.elapsed().unwrap_or(Duration::MAX).as_millis();
-                                DATADOG.timing("orb.main.time.camera.ir_frame", delay.try_into().unwrap_or(i64::MAX), NO_TAGS).or_log();
-                                latest_timestamp = SystemTime::now();
-                                frame_counter += 1;
-                            }
-                            Ok(None) => {} // woken by async context
-                            Err(err) => {
-                                if let Some(state_tx) = &mut self.state_tx {
-                                    state_tx.send_now(super::State::Error)?;
-                                }
-                                tracing::error!("IR camera V4L buffer dequeue failed: {}", err);
-                                restart = true;
-                                break;
-                            }
-                        }
-                        if latest_timestamp.elapsed().unwrap_or_default() > Duration::from_millis(500) {
-                            if let Some(state_tx) = &mut self.state_tx {
-                                state_tx.send_now(super::State::Error)?;
-                            }
-                            DATADOG.incr("orb.main.count.hardware.camera.issue.ir_camera.problem_restarting", NO_TAGS).or_log();
-                            tracing::error!("IR camera doesn't work. Restarting.");
-                            restart = true;
-                            break;
-                        }
-                        if let Poll::Ready(ready) = Pin::new(&mut port).poll_ready(cx) {
-                            ready?;
-                            if let Some(frame) = latest_frame.take() {
-                                let frame = frame.convert(flip, self.rotation, &mut scratch_buffer);
-                                Pin::new(&mut port).start_send(port::Output::new(frame))?;
-                            }
-                        }
-                    }
-                    sensor.stop()?;
-                    if restart {
-                        break Ok(());
+                        state_tx.send_now(super::State::Error)?;
+                        tracing::warn!("IR camera: {err}");
                     }
                 }
-            })??;
+            }
         }
         Ok(())
     }
 }
 
-impl port::Outer<Sensor> {
-    /// Stops the capturing and returns configuration history log.
-    pub async fn stop(&mut self) -> Result<Log> {
-        let (tx, rx) = oneshot::channel();
-        self.send(port::Input::new(Command::Stop(tx))).await?;
-        Ok(rx.await?)
+impl Sensor {
+    #[allow(clippy::too_many_lines)]
+    fn main_loop(&mut self, port: &mut port::Inner<Self>) -> Result<bool> {
+        let mut exit = false;
+        let mut scratch_buffer = Vec::<u16>::with_capacity((IR_WIDTH * IR_HEIGHT) as usize);
+        let sensor = Device::open(self.device_path)?;
+        let mut format = sensor.format()?;
+        format.pixel_format = PIX_FMT;
+        format = sensor.set_format(&format)?;
+        ensure!(format.pixel_format == PIX_FMT, "couldn't set pixel format");
+        sensor.set_control("Trigger Mode", TRIGGER_MODE)?;
+        sensor.set_control("Gain", IR_CAMERA_DEFAULT_GAIN)?;
+        sensor.set_control("Exposure", IR_CAMERA_DEFAULT_EXPOSURE)?;
+        sensor.set_control("Black Level", IR_CAMERA_DEFAULT_BLACK_LEVEL)?;
+        let buf = Buffer::new(&sensor, BUF_COUNT)?;
+        sensor.with_waiter_context(|waiter, cx| {
+            'enable: loop {
+                if !self.capturing {
+                    'start: loop {
+                        poll_commands! { |port, cx|
+                            Some(Command::SetGain(gain)) => sensor.set_control("Gain", gain)?,
+                            Some(Command::SetExposure(exposure)) => sensor.set_control("Exposure", exposure)?,
+                            Some(Command::SetFlip(new_flip)) => self.flip = new_flip,
+                            Some(Command::SetBlackLevel(black_level)) => {
+                                sensor.set_control("Black Level", black_level)?;
+                            }
+                            Some(Command::Start) => break 'start,
+                            None => {
+                                exit = true;
+                                break 'enable Ok(());
+                            }
+                        }
+                        waiter.wait_event(SLEEP_TIMEOUT)?;
+                    }
+                    self.capturing = true;
+                }
+                if let Some(state_tx) = &mut self.state_tx {
+                    state_tx.send_now(super::State::Capturing)?;
+                }
+                for i in 0..buf.count() {
+                    buf.enqueue(i)?;
+                }
+                sensor.start()?;
+                let capture_start_timestamp = Instant::now();
+                let mut log = Log::default();
+                let mut frame_counter: u64 = 0;
+                let mut latest_frame = None;
+                let mut latest_timestamp = SystemTime::now();
+                let log_tx = 'capture: loop {
+                    poll_commands! { |port, cx|
+                        Some(Command::SetGain(gain)) => {
+                            sensor.set_control("Gain", gain)?;
+                            log.gain.push(gain);
+                        }
+                        Some(Command::SetExposure(exposure)) => {
+                            sensor.set_control("Exposure", exposure)?;
+                            log.exposure.push(exposure);
+                        }
+                        Some(Command::SetFlip(new_flip)) => {
+                            self.flip = new_flip;
+                        }
+                        Some(Command::Stop(log_tx)) => {
+                            break 'capture log_tx;
+                        }
+                        Some(Command::SetBlackLevel(black_level)) => {
+                            sensor.set_control("Black Level", black_level)?;
+                        }
+                        None => {
+                            exit = true;
+                            break 'enable Ok(());
+                        },
+                    }
+                    waiter.wait(SLEEP_TIMEOUT)?;
+                    match buf.dequeue() {
+                        Ok(Some(dequeued)) => {
+                            let timestamp = dequeued.timestamp;
+                            latest_frame = Some(PendingFrame::new(
+                                &buf,
+                                dequeued.index,
+                                timestamp,
+                                &format,
+                            ));
+                            dd_timing!("main.time.camera.ir_frame", latest_timestamp);
+                            latest_timestamp = SystemTime::now();
+                            frame_counter += 1;
+                        }
+                        Ok(None) => {} // woken by async context
+                        Err(err) => {
+                            if let Some(state_tx) = &mut self.state_tx {
+                                state_tx.send_now(super::State::Error)?;
+                            }
+                            tracing::warn!("IR camera V4L buffer dequeue failed: {err}");
+                            sensor.stop()?;
+                            break 'enable Ok(());
+                        }
+                    }
+                    if latest_timestamp.elapsed().unwrap_or_default() > Duration::from_millis(500) {
+                        if let Some(state_tx) = &mut self.state_tx {
+                            state_tx.send_now(super::State::Error)?;
+                        }
+                        dd_incr!("main.count.hardware.camera.issue.ir_camera.problem_restarting");
+                        tracing::warn!("IR camera time out");
+                        sensor.stop()?;
+                        break 'enable Ok(());
+                    }
+                    if let Poll::Ready(ready) = Pin::new(&mut *port).poll_ready(cx) {
+                        ready?;
+                        if let Some(frame) = latest_frame.take() {
+                            let frame = frame.convert(self.flip, self.rotation, &mut scratch_buffer);
+                            Pin::new(&mut *port).start_send(port::Output::new(frame))?;
+                        }
+                    }
+                };
+                let capture_time = capture_start_timestamp.elapsed().as_secs();
+                log.fps = if capture_time > 0 {
+                    frame_counter / capture_time
+                } else {
+                    0
+                };
+                tracing::info!("FPS of video device {}: {}", self.device_path, log.fps);
+                #[allow(let_underscore_drop)]
+                let _ = log_tx.send(log);
+                if let Some(state_tx) = &mut self.state_tx {
+                    state_tx.send_now(super::State::Idle)?;
+                }
+                self.capturing = false;
+                sensor.stop()?;
+            }
+        })??;
+        Ok(exit)
     }
+}
+
+/// Stops the capturing and returns configuration history log.
+pub async fn stop(port: &mut port::Outer<Sensor>) -> Result<Log> {
+    let (tx, rx) = oneshot::channel();
+    port.send(port::Input::new(Command::Stop(tx))).await?;
+    Ok(rx.await?)
 }
 
 impl Default for Log {
@@ -335,6 +350,10 @@ impl super::Frame for Frame {
         let mut writer = encoder.write_header()?;
         writer.write_image_data(&self.data)?;
         Ok(())
+    }
+
+    fn as_bytes(&self) -> &[u8] {
+        &self.data
     }
 
     fn timestamp(&self) -> Duration {
@@ -461,7 +480,7 @@ impl PendingFrame<'_> {
             let sum: u64 = dst.iter().map(|&px| u64::from(px)).sum();
             (sum / dst.len() as u64) as u8
         };
-        DATADOG.gauge("orb.main.gauge.camera.ir_camera.mean", mean.to_string(), NO_TAGS).or_log();
+        dd_gauge!("main.gauge.camera.ir_camera.mean", mean.to_string());
         Frame::new(dst, self.timestamp, width, height, mean)
     }
 }

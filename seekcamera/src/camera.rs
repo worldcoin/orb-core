@@ -1,5 +1,6 @@
 use crate::{
     error::{result_from, Error},
+    frame::Rotation,
     register_event_callback, register_frame_callback, Frame,
 };
 use seekcamera_sys::{
@@ -80,14 +81,15 @@ impl Camera {
     /// # Errors
     ///
     /// See [`AttachError`] for all possible errors.
-    pub fn attach(connection_timeout: Duration) -> Result<Self, AttachError> {
+    pub fn attach(connection_timeout: Duration, rotation: Rotation) -> Result<Self, AttachError> {
         let camera_manager = manager_create().map_err(AttachError::ManagerCreate)?;
         let event_rx = unsafe {
             make_event_channel(camera_manager).map_err(AttachError::RegisterEventCallback)?
         };
         let camera = unsafe { camera_connect(&event_rx, connection_timeout)? };
-        let frame_rx =
-            unsafe { make_frame_channel(camera).map_err(AttachError::RegisterFrameCallback)? };
+        let frame_rx = unsafe {
+            make_frame_channel(camera, rotation).map_err(AttachError::RegisterFrameCallback)?
+        };
         Ok(Self { camera_manager, camera, event_rx, frame_rx })
     }
 
@@ -228,12 +230,15 @@ unsafe fn make_event_channel(camera_manager: *mut seekcamera_manager_t) -> Resul
     Ok(event_rx)
 }
 
-unsafe fn make_frame_channel(camera: *mut seekcamera_t) -> Result<FrameRx, Error> {
+unsafe fn make_frame_channel(
+    camera: *mut seekcamera_t,
+    rotation: Rotation,
+) -> Result<FrameRx, Error> {
     let (frame_tx, frame_rx) = mpsc::channel();
     // NOTE the callback will be leaked when the camera interface is dropped.
     // Normally we should keep the interface open forever.
     let callback = move |camera, frame| {
-        let frame = unsafe { Frame::obtain(frame) };
+        let frame = unsafe { Frame::obtain(frame, &rotation) };
         let _ = frame_tx.send((camera, frame));
     };
     unsafe { register_frame_callback(camera, Box::new(callback))? };

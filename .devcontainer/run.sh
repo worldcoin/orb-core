@@ -6,7 +6,7 @@
 set -eux
 
 # We do this to be agnostic to cwd when we invoke the script.
-ORB_DIR=$(dirname "$0")/../
+ORB_DIR="$(realpath "$(dirname "${0}")/../")"
 
 # Figure out what the command we will execute will be, store it in CMD.
 if [ "$#" -eq "0" ]; then
@@ -22,5 +22,5 @@ CONTAINER_ID=$(devcontainer up --workspace-folder "$ORB_DIR" | sed 's/.*"contain
 # Actually execute CMD. We do this instead of devcontainer exec because the 
 # latter caused issues with TUIs like neovim, whereas docker exec does not seem
 # to have these issues.
-docker exec -it -w /workspaces/orb-core "$CONTAINER_ID" $CMD
+docker exec -it -w /workspaces/"$(basename "${ORB_DIR}")" "$CONTAINER_ID" $CMD
 

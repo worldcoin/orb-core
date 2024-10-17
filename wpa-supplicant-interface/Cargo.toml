@@ -1,7 +1,8 @@
 [package]
 name = "wpa-supplicant-interface"
 version = "0.1.0"
-edition = "2021"
+edition.workspace = true
+license.workspace = true
 description = "Restricted orb-core interface to wpa_supplicant"
 
 [dependencies]

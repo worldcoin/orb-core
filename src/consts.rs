@@ -4,8 +4,44 @@ use crate::mcu::main::IrLed;
 use sodiumoxide::crypto::box_;
 use std::{ops::RangeInclusive, time::Duration};
 
+/// The path that the SSD is mounted in, configured in /etc/fstab
+pub const SSD_MOUNT_DIR: &str = "/mnt/scratch";
+
+/// The path to the SSD mapper device.
+pub const SSD_MAPPER_PATH: &str = "/dev/mapper/scratch";
+
+/// Minimal available SSD space in order to write data.
+pub const MIN_AVAILABLE_SSD_SPACE: u64 = 50_000_000;
+
+/// Minimal available SSD space to try to reclaim before starting a new signup.
+pub const MIN_AVAILABLE_SSD_SPACE_BEFORE_SIGNUP: u64 = 3_200_000_000;
+
+#[cfg(test)]
+pub const DATA_ACQUISITION_BASE_DIR: &str = "./tmp/test/data_acquisition";
+#[cfg(not(test))]
+/// Location on SSD to save signup data.
+pub const DATA_ACQUISITION_BASE_DIR: &str =
+    const_format::formatcp!("{}/{}", SSD_MOUNT_DIR, "orb_tmp/data/data_acquisition");
+
+#[cfg(test)]
+pub const DATA_UPLOADER_BASE_DIR: &str = "./tmp/test/data_uploader";
+#[cfg(not(test))]
+/// Location on SSD to save data for asyncrhonous upload.
+pub const DATA_UPLOADER_BASE_DIR: &str =
+    const_format::formatcp!("{}/{}", SSD_MOUNT_DIR, "orb_tmp/data/data_uploader");
+
+#[cfg(test)]
+pub const SSD_STRESS_TEST_FILE: &str = "./tmp/test/ssd_stress.tmp";
+#[cfg(not(test))]
+/// Location on SSD to save signup data.
+pub const SSD_STRESS_TEST_FILE: &str =
+    const_format::formatcp!("{}/{}", SSD_MOUNT_DIR, "orb_tmp/data/ssd_stress.tmp");
+
 /// Path to the configuration directory.
-pub const CONFIG_DIR: &str = "/usr/persistent/";
+pub const CONFIG_DIR: &str = "/usr/persistent";
+
+/// Path to the mirror calibration configuration file.
+pub const CALIBRATION_FILE_PATH: &str = const_format::formatcp!("{}/calibration.json", CONFIG_DIR);
 
 /// Path to the configuration directory.
 pub const RGB_CALIBRATION_FILE: &str = "rgb_calibration.json";
@@ -34,15 +70,18 @@ pub const BUTTON_DOUBLE_PRESS_DURATION: Duration = Duration::from_millis(450);
 /// Time window after a double press to ensure it's not a triple press.
 pub const BUTTON_DOUBLE_PRESS_DEAD_TIME: Duration = Duration::from_millis(250);
 
-/// Battery voltage threshold to shutdown the device when device in Idle state.
+/// Battery voltage threshold to shutdown the device when device is in Idle state.
 pub const BATTERY_VOLTAGE_SHUTDOWN_IDLE_THRESHOLD_MV: i32 = 13350;
 
-/// Battery voltage threshold to shutdown the device when device in Idle state.
-pub const BATTERY_VOLTAGE_SHUTDOWN_BIOMETRIC_CAPTURE_THRESHOLD_MV: i32 = 12500;
+/// Battery voltage threshold to shutdown the device when device is in Signup state.
+pub const BATTERY_VOLTAGE_SHUTDOWN_SIGNUP_THRESHOLD_MV: i32 = 12500;
 
 /// Delay left for Jetson to shut down. The microcontroller will force shut down after this delay
 /// if no shutdown request signal is received.
 pub const GRACEFUL_SHUTDOWN_MAX_DELAY_SECONDS: u8 = 20;
+
+/// Time it takes for the shutdown sound to play
+pub const SHUTDOWN_SOUND_DURATION: Duration = Duration::from_millis(2000);
 
 /// Backend config update interval.
 pub const CONFIG_UPDATE_INTERVAL: Duration = Duration::from_secs(10);
@@ -61,6 +100,8 @@ pub const QR_SCAN_INTERVAL: Duration = Duration::from_millis(1500);
 
 /// Face detection timeout.
 pub const DETECT_FACE_TIMEOUT: Duration = Duration::from_secs(20);
+/// Face detection timeout for app-based self-serve mode.
+pub const DETECT_FACE_TIMEOUT_SELF_SERVE: Duration = Duration::from_secs(11);
 
 /// Default IR (infrared) LED duration in microseconds.
 pub const DEFAULT_IR_LED_DURATION: u16 = 350;
@@ -135,11 +176,29 @@ pub const RGB_EXPOSURE_RANGE: RangeInclusive<u32> = 34_000..=358_733_008;
 /// RGB camera FPS.
 pub const RGB_FPS: u32 = 20;
 
-/// Number of columns in raw frames from the camera.
+/// RGB camera FPS reduced for self-serve idle QR-scanning mode.
+pub const RGB_FPS_REDUCED: u32 = 2;
+
+/// Number of columns in raw frames from the thermal camera.
 pub const THERMAL_WIDTH: u32 = 156;
 
-/// Number of rows in raw frames from the camera.
+/// Number of rows in raw frames from the thermal camera.
 pub const THERMAL_HEIGHT: u32 = 206;
+
+/// Depth camera FPS.
+pub const DEPTH_USE_CASE: &str = "Mode_5_15fps";
+
+/// Depth camera exposure mode.
+pub const DEPTH_EXPOSURE_MANUAL: bool = true;
+
+/// Depth camera exposure time in microseconds.
+pub const DEPTH_EXPOSURE_TIME: u32 = 1020;
+
+/// Number of columns in raw frames from the depth camera.
+pub const DEPTH_WIDTH: u32 = 172;
+
+/// Number of rows in raw frames from the depth camera.
+pub const DEPTH_HEIGHT: u32 = 224;
 
 /// LED engine FPS.
 pub const LED_ENGINE_FPS: u64 = 60;
@@ -197,11 +256,38 @@ pub const RGB_SAVE_FPS: f32 = 0.5;
 /// FPS to save Thermal images
 pub const THERMAL_SAVE_FPS: f32 = 0.5;
 
+/// Livestream frame width.
+pub const LIVESTREAM_FRAME_WIDTH: u32 = 1920;
+
+/// Livestream frame height.
+pub const LIVESTREAM_FRAME_HEIGHT: u32 = 1080;
+
 /// Minimal interval between slower, closer or farther sounds.
 pub const IR_VOICE_TIME_INTERVAL: Duration = Duration::from_secs(2);
 
-/// Time to switch between eyes for one mirror.
-pub const SWITCH_EYE_DELAY: Duration = Duration::from_millis(300);
+/// Minimum phi angle for the mirror, on Pearl.
+pub const MIRROR_PHI_MIN_PEARL: u32 = 45000 - 9500;
+
+/// Maximum phi angle for the mirror, on Pearl.
+pub const MIRROR_PHI_MAX_PEARL: u32 = 45000 + 9500;
+
+/// Minimum theta angle for the mirror, on Pearl.
+pub const MIRROR_THETA_MIN_PEARL: u32 = 90000 - 17500;
+
+/// Maximum theta angle for the mirror, on Pearl.
+pub const MIRROR_THETA_MAX_PEARL: u32 = 90000 + 17500;
+
+/// Minimum phi angle for the mirror, on Diamond.
+pub const MIRROR_PHI_MIN_DIAMOND: u32 = 45000 - 13000;
+
+/// Maximum phi angle for the mirror, on Diamond.
+pub const MIRROR_PHI_MAX_DIAMOND: u32 = 45000 + 13000;
+
+/// Minimum theta angle for the mirror, on Diamond.
+pub const MIRROR_THETA_MIN_DIAMOND: u32 = 90000 - 20000;
+
+/// Maximum theta angle for the mirror, on Diamond.
+pub const MIRROR_THETA_MAX_DIAMOND: u32 = 90000 + 20000;
 
 /// Reducer coefficient for continuous calibration. Must be less than or equal
 /// to `1.0`.
@@ -209,6 +295,8 @@ pub const CONTINUOUS_CALIBRATION_REDUCER: f64 = 0.05;
 
 /// Timeout for the biometric capture phase.
 pub const BIOMETRIC_CAPTURE_TIMEOUT: Duration = Duration::from_secs(45);
+/// Timeout for the biometric capture phase for app-based self-serve mode.
+pub const DEFAULT_BIOMETRIC_CAPTURE_TIMEOUT_SELF_SERVE: Duration = Duration::from_secs(30);
 
 /// Maximum time for Wifi network connection state.
 pub const NETWORK_CONNECTION_TIMEOUT: Duration = Duration::from_secs(10);
@@ -240,11 +328,12 @@ pub const WORLDCOIN_ENCRYPTION_PUBKEY: box_::PublicKey = {
     }
 };
 
-/// WC Data Encryption Private key (only on staging!)
-// NOTE(open-source): This is a bogus key.
-#[cfg(feature = "stage")]
-pub const WORLDCOIN_ENCRYPTION_SECRETKEY: box_::SecretKey =
-    box_::SecretKey([0xFF; box_::SECRETKEYBYTES]);
+/// WC Data Encryption Private key (only for tests!)
+#[cfg(all(feature = "stage", test))]
+pub const WORLDCOIN_ENCRYPTION_SECRETKEY: box_::SecretKey = box_::SecretKey([
+    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+]);
 
 /// The well known name used as a bus name to register on dbus.
 pub const DBUS_WELL_KNOWN_BUS_NAME: &str = "org.worldcoin.OrbCore1";
@@ -264,6 +353,13 @@ pub const DEFAULT_MAX_FAN_SPEED: f32 = 100.0;
 
 /// Length of the across signup face correlation queue.
 pub const ACROSS_SIGNUP_FACE_CORRELATION_QUEUE_LENGTH: usize = 100;
+
+/// This is to defend against inaccuracies in IR-Net, which lead to accepting
+/// the same eye as the second capture.
+pub const DEFAULT_DELAY_BETWEEN_EYE_CAPTURES: Duration = Duration::from_millis(200);
+
+/// Default image upload delay in seconds.
+pub const DEFAULT_IMAGE_UPLOAD_DELAY: u64 = 60 * 60;
 
 /// Default maximum ping delay in milliseconds for acceptable network connection.
 pub const DEFAULT_SLOW_INTERNET_PING_THRESHOLD: Duration = Duration::from_millis(700);

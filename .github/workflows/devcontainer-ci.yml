@@ -8,16 +8,16 @@ on:
       - flake.lock
   push:
     branches:
-      - main
+      - master
 
 jobs:
   test_build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04-32core
     steps:
       - name: Check out code
-        uses: actions/checkout@ee0669bd1cc54295c223e0bb666b733df41de1c5 # pin@v2
+        uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332 # pin@v2v4.1.7
       - name: Pre-build dev container image
-        uses: devcontainers/ci@57eaf0c9b518a76872bc429cdceefd65a912309b # pin@v0.3
+        uses: devcontainers/ci@a56d055efecd725e8cfe370543b6071b79989cc8 # pin@v0.3.1900000349
         env:
           CACHIX_AUTH_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}
           GITHUB_TOKEN: ${{ secrets.GIT_HUB_TOKEN }}

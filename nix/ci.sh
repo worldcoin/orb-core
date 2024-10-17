@@ -3,7 +3,7 @@
 cd "$(dirname $0)/.."
 set -e
 
-ALL="fmt clippy test build doc check_debug_report_version"
+ALL="deny fmt clippy test build build_livestream_client doc check_debug_report_version"
 if [ "$#" -eq 0 ]; then
   eval set -- $ALL
 fi
@@ -15,6 +15,13 @@ while [ "$#" -gt 0 ]; do
   --server)
     SERVER=1
     export TERM=dumb
+    ;;
+  deny)
+    echo "+++ Checking licenses and advisories with $(tput bold)cargo deny$(tput sgr0)"
+    (
+      set -x
+      cargo deny check
+    )
     ;;
   fmt)
     echo "+++ Checking code formatting with $(tput bold)rustfmt$(tput sgr0)"
@@ -38,7 +45,7 @@ while [ "$#" -gt 0 ]; do
     fi
     ;;
   check_debug_report_version)
-    echo "+++ Checking Singup Data version"
+    echo "+++ Checking Signup Data version"
     if [ "$SERVER" = "1" ]; then
       (
         set -x
@@ -61,7 +68,7 @@ while [ "$#" -gt 0 ]; do
     else
       (
         set -x
-        nix/native.sh cargo test --workspace
+        nix/native.sh cargo test --workspace -- --include-ignored
       )
     fi
     ;;
@@ -70,6 +77,13 @@ while [ "$#" -gt 0 ]; do
     (
       set -x
       nix build --print-build-logs '.#build'
+    )
+    ;;
+  build_livestream_client)
+    echo "+++ Building final $(tput bold)livestream-client binaries$(tput sgr0)"
+    (
+      set -x
+      nix build --print-build-logs '.#build_livestream_client'
     )
     ;;
   doc)

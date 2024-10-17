@@ -13,34 +13,39 @@
 
 use crate::{
     agents::{
-        python::{ir_net, iris},
-        Agent,
+        python::{ir_net, iris, occlusion},
+        ProcessInitializer,
     },
     config::Config,
     consts::{RGB_NATIVE_HEIGHT, RGB_NATIVE_WIDTH},
-    inst_elapsed,
-    port::{Port, SharedPort},
 };
-use eyre::Result;
+use agentwire::{
+    agent::{self, Agent as _},
+    port::{self, Port, SharedPort},
+};
+use eyre::{Error, Result};
 use pyo3::Python;
 use rkyv::{Archive, Deserialize, Serialize};
 use schemars::JsonSchema;
 use serde::Serialize as SerdeSerialize;
 use std::{mem::size_of, time::Instant};
 
+use super::AgentPython as _;
+
 /// Mega Agent One.
 ///
 /// See [the module-level documentation](self) for details.
 #[derive(Clone, Debug, Archive, Serialize, Deserialize, SerdeSerialize, JsonSchema)]
-#[schemars(rename = "MegaAgentOneConfig")]
 pub struct MegaAgentOne {
     /// Initial state for the IR-Net model.
     pub ir_net: ir_net::Model,
     /// Initial state for the Iris model.
     pub iris: iris::Model,
+    /// Initial state for the Occlusion model.
+    pub occlusion: occlusion::Model,
 }
 
-impl super::Agent for MegaAgentOne {
+impl agentwire::Agent for MegaAgentOne {
     const NAME: &'static str = "mega-agent-one";
 }
 
@@ -48,6 +53,8 @@ impl super::Agent for MegaAgentOne {
 /// appropriate AI model.
 #[derive(Debug, Archive, Serialize)]
 pub enum Input {
+    /// Input for the Occlusion model.
+    Occlusion(occlusion::Input),
     /// Input for the Iris model.
     Iris(iris::Input),
     /// Input for the IR-Net model.
@@ -60,6 +67,8 @@ pub enum Input {
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Archive, Serialize, Deserialize)]
 pub enum Output {
+    /// Output for the Occlusion model.
+    Occlusion(occlusion::Output),
     /// Output for the Iris model.
     Iris(iris::Output),
     /// Output for the IR-Net model.
@@ -77,9 +86,11 @@ impl Port for MegaAgentOne {
 }
 
 impl SharedPort for MegaAgentOne {
-    const SERIALIZED_CONFIG_EXTRA_SIZE: usize =
-        <ir_net::Model as SharedPort>::SERIALIZED_CONFIG_EXTRA_SIZE
-            + <iris::Model as SharedPort>::SERIALIZED_CONFIG_EXTRA_SIZE;
+    const SERIALIZED_INIT_SIZE: usize = size_of::<usize>()
+        + size_of::<<MegaAgentOne as Archive>::Archived>()
+        + <ir_net::Model as SharedPort>::SERIALIZED_INIT_SIZE
+        + <iris::Model as SharedPort>::SERIALIZED_INIT_SIZE
+        + <occlusion::Model as SharedPort>::SERIALIZED_INIT_SIZE;
     const SERIALIZED_INPUT_SIZE: usize = size_of::<<Input as Archive>::Archived>()
         + (RGB_NATIVE_HEIGHT as usize * RGB_NATIVE_WIDTH as usize * 3) * 2;
     const SERIALIZED_OUTPUT_SIZE: usize = size_of::<<Output as Archive>::Archived>()
@@ -87,6 +98,7 @@ impl SharedPort for MegaAgentOne {
 }
 
 struct Environment<'py> {
+    occlusion_env: Box<dyn super::Environment<occlusion::Model> + 'py>,
     iris_env: Box<dyn super::Environment<iris::Model> + 'py>,
     ir_net_env: Box<dyn super::Environment<ir_net::Model> + 'py>,
     config: MegaAgentOne,
@@ -95,6 +107,10 @@ struct Environment<'py> {
 impl super::Environment<MegaAgentOne> for Environment<'_> {
     fn iterate(&mut self, py: Python, input: &ArchivedInput) -> Result<Output> {
         match input {
+            ArchivedInput::Occlusion(input) => {
+                tracing::debug!("{}: Received input for Occlusion model", MegaAgentOne::NAME);
+                Ok(Output::Occlusion(self.occlusion_env.iterate(py, input)?))
+            }
             ArchivedInput::Iris(input) => {
                 tracing::debug!("{}: Received input for Iris", MegaAgentOne::NAME);
                 Ok(Output::Iris(self.iris_env.iterate(py, input)?))
@@ -121,21 +137,34 @@ impl super::AgentPython for MegaAgentOne {
         let config_clone = self.clone();
         let t = Instant::now();
 
+        let occlusion_env = occlusion::Model::init(self.occlusion, py)?;
         let iris_env = iris::Model::init(self.iris, py)?;
         let ir_net_env = ir_net::Model::init(self.ir_net, py)?;
 
         tracing::info!(
             "Python agent {} <benchmark>: initialization done in {} ms",
             MegaAgentOne::NAME,
-            inst_elapsed!(t)
+            t.elapsed().as_millis()
         );
 
-        Ok(Box::new(Environment { iris_env, ir_net_env, config: config_clone }))
+        Ok(Box::new(Environment { occlusion_env, iris_env, ir_net_env, config: config_clone }))
+    }
+}
+
+impl agentwire::agent::Process for MegaAgentOne {
+    type Error = Error;
+
+    fn run(self, port: port::RemoteInner<Self>) -> Result<(), Self::Error> {
+        self.run_python_process(port)
+    }
+
+    fn initializer() -> impl agent::process::Initializer {
+        ProcessInitializer::default()
     }
 }
 
 impl From<&Config> for MegaAgentOne {
     fn from(config: &Config) -> Self {
-        Self { iris: config.into(), ir_net: config.into() }
+        Self { occlusion: occlusion::Model::default(), iris: config.into(), ir_net: config.into() }
     }
 }

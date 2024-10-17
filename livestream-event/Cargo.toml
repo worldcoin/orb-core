@@ -1,0 +1,11 @@
+[package]
+name = "livestream-event"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+authors = ["Valentine Valyaeff <valentine.valyaeff@gmail.com>"]
+publish = false
+
+[dependencies]
+egui.workspace = true
+rkyv = { workspace = true, features = ["validation"] }

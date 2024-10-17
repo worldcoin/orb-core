@@ -1,27 +1,29 @@
 //! Image upload agent
+//!
+//! This agent will use the files saved to disk by [`crate::agents::image_notary`].
+//!
+//! It is only enabled with the `internal-data-acquisition` feature.
 
-#[cfg(not(feature = "no-image-encryption"))]
-use crate::agents::encrypt_and_seal;
 use crate::{
-    agents::{
-        camera::{self, Frame},
-        python::iris::NormalizedIris,
-    },
     backend::{presigned_url::UrlType, upload_image},
-    inst_elapsed,
-    logger::{LogOnError, DATADOG, NO_TAGS},
-    port,
-    port::Port,
+    consts::DATA_ACQUISITION_BASE_DIR,
+    dd_gauge, dd_incr, dd_timing, ssd,
 };
-use async_trait::async_trait;
-use eyre::Result;
-use futures::{channel::oneshot, prelude::*, select};
+use agentwire::port::{self, Port};
+use bytesize::ByteSize;
+use eyre::{Error, Result};
+use futures::{future::Fuse, pin_mut, prelude::*, select};
 use orb_wld_data_id::{ImageId, SignupId};
+use rand::{prelude::SliceRandom, thread_rng};
 use std::{
-    convert::{Infallible, TryInto},
-    io::Cursor,
+    convert::Infallible,
+    path::{Path, PathBuf},
+    pin::Pin,
     time::{Duration, Instant, SystemTime},
 };
+use tokio::{fs, task::spawn_blocking, time::sleep};
+
+type UploadImages = Pin<Box<dyn Future<Output = Result<()>> + Send>>;
 
 /// Image upload agent
 #[derive(Default, Debug)]
@@ -31,18 +33,10 @@ pub struct Agent;
 #[allow(missing_docs)]
 #[derive(Debug)]
 pub enum Input {
-    /// Upload the self-custody thumbnail for a specific signup. This op is used in a blocking context.
-    UploadSelfCustodyThumbnail {
-        tx: oneshot::Sender<ImageId>,
-        signup_id: SignupId,
-        self_custody_thumbnail: camera::rgb::Frame,
-    },
-    UploadIrisNormalizedImages {
-        tx: oneshot::Sender<[Option<ImageId>; 4]>,
-        signup_id: SignupId,
-        left: Option<NormalizedIris>,
-        right: Option<NormalizedIris>,
-    },
+    /// Start uploading all currently available images.
+    StartUpload { image_upload_delay: Duration },
+    /// Stop upload - killing any pending requests.
+    PauseUpload,
 }
 
 impl Port for Agent {
@@ -53,22 +47,28 @@ impl Port for Agent {
     const OUTPUT_CAPACITY: usize = 0;
 }
 
-impl super::Agent for Agent {
-    const NAME: &'static str = "data-uploader";
+impl agentwire::Agent for Agent {
+    const NAME: &'static str = "image-uploader";
 }
 
-#[async_trait]
-impl super::AgentTask for Agent {
+impl agentwire::agent::Task for Agent {
+    type Error = Error;
+
     #[allow(clippy::mut_mut)] // triggered by `select!` internals
-    async fn run(mut self, mut port: port::Inner<Self>) -> Result<()> {
+    async fn run(mut self, mut port: port::Inner<Self>) -> Result<(), Self::Error> {
+        let network_request = Fuse::terminated();
+        pin_mut!(network_request);
         loop {
             select! {
                 input = port.next() => {
                     if let Some(input) = input {
-                        self.handle_input(input.value).await?;
+                        self.handle_input(input.value, &mut network_request).await?;
                     } else {
                         break;
                     }
+                }
+                _ = network_request => {
+                    tracing::info!("Data upload complete.");
                 }
             }
         }
@@ -82,54 +82,66 @@ impl super::AgentTask for Agent {
 /// Orb states are mutually exclusive with respect to execution.
 impl Agent {
     #[allow(clippy::unused_async)]
-    async fn handle_input(&mut self, input: Input) -> Result<()> {
+    async fn handle_input(
+        &mut self,
+        input: Input,
+        network_request: &mut Pin<&mut Fuse<UploadImages>>,
+    ) -> Result<()> {
         match input {
-            Input::UploadSelfCustodyThumbnail { tx, signup_id, self_custody_thumbnail } => {
-                let _ = tx
-                    .send(upload_self_custody_thumbnail(signup_id, self_custody_thumbnail).await?);
+            Input::StartUpload { image_upload_delay } => {
+                let box_var: UploadImages = Box::pin(upload_all_signup_images(image_upload_delay));
+                network_request.set(box_var.fuse());
             }
-            Input::UploadIrisNormalizedImages { tx, signup_id, left, right } => {
-                let _ = tx.send(upload_iris_normalized_images(signup_id, left, right).await?);
+            Input::PauseUpload => {
+                //Immediately drop any pending request.
+                network_request.set(Fuse::terminated());
             }
         }
         Ok(())
     }
 }
 
-impl port::Outer<Agent> {
-    /// Upload the self-custody thumbnail of a specific signup from memory.
-    pub async fn upload_self_custody_thumbnail(
-        &mut self,
-        signup_id: SignupId,
-        self_custody_thumbnail: camera::rgb::Frame,
-    ) -> Result<ImageId> {
-        let (tx, rx) = oneshot::channel();
-        self.send(port::Input::new(Input::UploadSelfCustodyThumbnail {
-            tx,
-            signup_id,
-            self_custody_thumbnail,
-        }))
-        .await?;
-        Ok(rx.await?)
+async fn upload_saved_images(
+    signup_dir: &Path,
+    image_dir_name: &str,
+    signup_id: &SignupId,
+    presigned_url_type: UrlType,
+) -> Result<()> {
+    let image_dir = signup_dir.join(image_dir_name);
+    if !image_dir.is_dir() {
+        tracing::warn!("The directory {:?} does not exist, skipping image upload", image_dir);
+        return Ok(());
     }
-
-    /// Upload the Iris normalized images of a specific signup from memory.
-    pub async fn upload_iris_normalized_images(
-        &mut self,
-        signup_id: SignupId,
-        left: Option<NormalizedIris>,
-        right: Option<NormalizedIris>,
-    ) -> Result<[Option<ImageId>; 4]> {
-        let (tx, rx) = oneshot::channel();
-        self.send(port::Input::new(Input::UploadIrisNormalizedImages {
-            tx,
+    let mut paths = Vec::new();
+    ssd::perform_async(async {
+        let mut dir_reader = fs::read_dir(&image_dir).await?;
+        while let Some(entry) = dir_reader.next_entry().await? {
+            let path = entry.path();
+            if path.extension().map_or(false, |path| path == "png") {
+                paths.push(path);
+            }
+        }
+        Ok(())
+    })
+    .await;
+    for path in paths {
+        let image_id = ImageId::from_image_path(&path)?;
+        let img_data = ssd::perform_async(async { fs::read(&path).await }).await;
+        let Some(img_data) = img_data else {
+            continue;
+        };
+        upload_image(
             signup_id,
-            left,
-            right,
-        }))
+            &image_id,
+            presigned_url_type,
+            img_data,
+            &path.display().to_string(),
+            image_dir_name,
+        )
         .await?;
-        Ok(rx.await?)
     }
+    ssd::perform_async(async { fs::remove_dir_all(image_dir).await }).await;
+    Ok(())
 }
 
 async fn upload_image(
@@ -145,110 +157,131 @@ async fn upload_image(
     let response =
         upload_image::request(signup_id, image_id, presigned_url_type, img_data, dd_image_tag)
             .await;
-    DATADOG
-        .timing(
-            format!("orb.main.time.data_collection.upload.{dd_image_tag}.full"),
-            inst_elapsed!(t),
-            NO_TAGS,
-        )
-        .or_log();
+    dd_timing!("main.time.data_acquisition.upload" + format!("{}.full", dd_image_tag), t);
     match response {
         Ok(()) => {
-            DATADOG
-                .incr(
-                    format!("orb.main.count.data_collection.upload.success.{dd_image_tag}"),
-                    NO_TAGS,
-                )
-                .or_log();
+            dd_incr!("main.count.data_acquisition.upload.success" + format!("{}", dd_image_tag));
         }
         Err(e) => {
-            DATADOG
-                .incr(
-                    format!("orb.main.count.data_collection.upload.error.{dd_image_tag}"),
-                    NO_TAGS,
-                )
-                .or_log();
+            dd_incr!("main.count.data_acquisition.upload.error" + format!("{}", dd_image_tag));
             tracing::error!("Uploading image {log_image_path} failed: {e}");
         }
     }
     Ok(())
 }
 
-async fn upload_self_custody_thumbnail(
-    signup_id: SignupId,
-    self_custody_thumbnail: camera::rgb::Frame,
-) -> Result<ImageId> {
-    tracing::info!("Start directly uploading self-custody thumbnail image");
-
-    let image_id = ImageId::new(&signup_id, self_custody_thumbnail.timestamp());
-    let mut data = Cursor::new(Vec::new());
-    self_custody_thumbnail.write_png(&mut data, camera::FrameResolution::MAX)?;
-    let data = data.into_inner();
-
-    #[cfg(not(feature = "no-image-encryption"))]
-    let data = encrypt_and_seal(&data);
-
-    upload_image(&signup_id, &image_id, UrlType::Rgb, data, "direct.thumbnail", "direct.thumbnail")
-        .await?;
-
-    Ok(image_id)
+async fn upload_signup_images(signup_dir: &Path) -> Result<()> {
+    // extract last element of signup directory path as String
+    let signup_id = SignupId::from_signup_dir(signup_dir)?;
+    let t0 = Instant::now();
+    upload_saved_images(signup_dir, "ir_camera", &signup_id, UrlType::Ir).await?;
+    dd_timing!("main.time.data_acquisition.upload.batch.ir_camera", t0);
+    let t1 = Instant::now();
+    upload_saved_images(signup_dir, "rgb_camera", &signup_id, UrlType::Rgb).await?;
+    dd_timing!("main.time.data_acquisition.upload.batch.rgb_camera", t1);
+    let t2 = Instant::now();
+    upload_saved_images(signup_dir, "ir_face", &signup_id, UrlType::IrFace).await?;
+    dd_timing!("main.time.data_acquisition.upload.batch.ir_face", t2);
+    let t3 = Instant::now();
+    upload_saved_images(signup_dir, "thermal", &signup_id, UrlType::Thermal).await?;
+    dd_timing!("main.time.data_acquisition.upload.batch.thermal", t3);
+    upload_identification_images_impl(signup_id).await?;
+    dd_timing!("main.time.data_acquisition.upload.batch.full_signup", t0);
+    ssd::perform_async(async { fs::remove_dir_all(signup_dir).await }).await;
+    Ok(())
 }
 
-async fn upload_iris_normalized_images(
-    signup_id: SignupId,
-    left: Option<NormalizedIris>,
-    right: Option<NormalizedIris>,
-) -> Result<[Option<ImageId>; 4]> {
-    tracing::info!("Start directly uploading iris normalized images");
+/// Return signup paths with a recency-biased ordering.
+/// Signups done within the last 24 hours come first, in random order.
+/// Signups older than 24 hours are simply sorted, newest to oldest.
+async fn get_signup_paths() -> impl Iterator<Item = PathBuf> {
+    let mut age_and_path = Vec::new();
+    ssd::perform_async(async {
+        let mut dir_reader = fs::read_dir(DATA_ACQUISITION_BASE_DIR).await?;
+        while let Some(entry) = dir_reader.next_entry().await? {
+            let path = entry.path();
+            if path.is_dir() {
+                let age = SystemTime::now()
+                    .duration_since(entry.metadata().await?.modified()?)
+                    .unwrap_or(Duration::MAX);
+                age_and_path.push((age, path));
+            }
+        }
+        age_and_path.sort();
+        age_and_path.reverse();
+        if let Some(one_day_index) =
+            age_and_path.iter().position(|&(age, _)| age > Duration::from_secs(60 * 60 * 24))
+        {
+            age_and_path.split_at_mut(one_day_index).0.shuffle(&mut thread_rng());
+        }
+        Ok(())
+    })
+    .await;
+    age_and_path.into_iter().map(|(_, path)| path)
+}
 
-    let time_now = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .expect("system time must be after UNIX EPOCH");
-    let (left_image_id, left_mask_id, right_image_id, right_mask_id) = (
-        ImageId::new(&signup_id, time_now + Duration::from_nanos(1)),
-        ImageId::new(&signup_id, time_now + Duration::from_nanos(2)),
-        ImageId::new(&signup_id, time_now + Duration::from_nanos(3)),
-        ImageId::new(&signup_id, time_now + Duration::from_nanos(4)),
-    );
-    let mut output = [None, None, None, None];
-
-    for (i, (n, tag, image_id, mask_id)) in [
-        (left, "left", left_image_id, left_mask_id),
-        (right, "right", right_image_id, right_mask_id),
-    ]
-    .iter()
-    .enumerate()
+fn log_data_to_upload_left() -> Result<()> {
+    if let Some(ssd::Stats { available_space, signups, documents, documents_size }) = ssd::stats()?
     {
-        if let Some(n) = n {
-            let data_image = n.serialized_image();
-            #[cfg(not(feature = "no-image-encryption"))]
-            let data_image = encrypt_and_seal(&data_image);
+        dd_gauge!("main.gauge.system.ssd.available_space", available_space.to_string());
+        dd_gauge!("main.gauge.data_acquisition.to_upload.signup", signups.to_string());
+        dd_gauge!("main.gauge.data_acquisition.to_upload.document", documents.to_string());
+        tracing::debug!(
+            "Image Uploader: Available SSD space: {}, Number of signups to upload: {signups}, \
+             Number of documents to upload: {documents}, Total size of documents to upload {}",
+            ByteSize::b(available_space),
+            if let Ok(size) = documents_size {
+                ByteSize::b(size).to_string()
+            } else {
+                "-1".to_owned()
+            },
+        );
+    }
+    Ok(())
+}
 
-            let data_mask = n.serialized_mask();
-            #[cfg(not(feature = "no-image-encryption"))]
-            let data_mask = encrypt_and_seal(&data_mask);
-
-            upload_image(
-                &signup_id,
-                image_id,
-                UrlType::NormalizedIrisImage,
-                data_image,
-                &format!("direct.normalized_image_{tag}"),
-                &format!("direct.normalized_image_{tag}"),
-            )
-            .await?;
-            upload_image(
-                &signup_id,
-                mask_id,
-                UrlType::NormalizedIrisMask,
-                data_mask,
-                &format!("direct.normalized_mask_{tag}"),
-                &format!("direct.normalized_mask_{tag}"),
-            )
-            .await?;
-            output[i * 2] = Some(image_id.clone());
-            output[(i * 2) + 1] = Some(mask_id.clone());
+async fn upload_all_signup_images(image_upload_delay: Duration) -> Result<()> {
+    // This long delay helps prevent uploading images while the Orb is connected to a hotspot (i.e. while doing signups)
+    // Generally, Orbs in the field will only be in the idle state beyond "image_upload_delay" if they are connected to
+    // Wifi to upload overnight
+    spawn_blocking(log_data_to_upload_left).await??;
+    sleep(image_upload_delay).await;
+    for path in get_signup_paths().await {
+        spawn_blocking(log_data_to_upload_left).await??;
+        tracing::info!("Starting to upload images from {}", path.display());
+        if let Err(err) = upload_signup_images(&path).await {
+            tracing::error!("Error uploading signup images from {}: {}", path.display(), err);
         }
     }
-    Ok(output)
+    Ok(())
+}
+
+async fn upload_identification_images_impl(signup_id: SignupId) -> Result<()> {
+    let signup_dir = Path::new(DATA_ACQUISITION_BASE_DIR).join(signup_id.to_string());
+    spawn_blocking(log_data_to_upload_left).await??;
+    tracing::info!("Starting to upload identification images from {}", signup_dir.display());
+    let identification_dir = signup_dir.join("identification");
+    if identification_dir.is_dir() {
+        upload_saved_images(&identification_dir.join("ir"), "left", &signup_id, UrlType::Ir)
+            .await?;
+        upload_saved_images(&identification_dir.join("ir"), "right", &signup_id, UrlType::Ir)
+            .await?;
+        upload_saved_images(&identification_dir.join("rgb"), "left", &signup_id, UrlType::Rgb)
+            .await?;
+        upload_saved_images(&identification_dir.join("rgb"), "right", &signup_id, UrlType::Rgb)
+            .await?;
+        upload_saved_images(
+            &identification_dir.join("rgb"),
+            "self_custody_candidate",
+            &signup_id,
+            UrlType::Rgb,
+        )
+        .await?;
+    } else {
+        tracing::warn!(
+            "The directory {:?} does not exist, skipping image upload",
+            identification_dir
+        );
+    }
+    Ok(())
 }

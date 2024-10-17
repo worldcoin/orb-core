@@ -2,13 +2,8 @@
 //! orb-short-lived-token-daemon running on the orb. If the daemon is not
 //! present falls back to using static token.
 
-use crate::{
-    dbus::AuthTokenProxy,
-    identification::ORB_TOKEN,
-    logger::{LogOnError, DATADOG},
-};
+use crate::{dbus::AuthTokenProxy, dd_incr, identification::ORB_TOKEN};
 use eyre::Result;
-
 use std::time::Duration;
 
 const TOKEN_MONITOR_INTERVAL: Duration = Duration::from_secs(60);
@@ -49,7 +44,6 @@ pub async fn monitor_token() -> ! {
 /// Waits for `ORB_TOKEN` from the token daemon before returning.
 pub async fn wait_for_token() {
     const TIME_BETWEEN_ATTEMPTS: Duration = Duration::from_secs(30);
-    const TOKEN_REQ_REATTEMPT: &str = "orb.main.count.global.token_request_reattempts";
     loop {
         let attempt_timeout = tokio::time::Instant::now() + TIME_BETWEEN_ATTEMPTS;
         let result = tokio::time::timeout_at(attempt_timeout, request_orb_token()).await;
@@ -58,13 +52,13 @@ pub async fn wait_for_token() {
             Ok(Ok(())) => break, // We got the token successfully
             Ok(Err(e)) => {
                 tracing::warn!("RPC to token daemon errored out, will retry shortly: {e}");
-                DATADOG.incr(TOKEN_REQ_REATTEMPT, crate::logger::NO_TAGS).or_log();
+                dd_incr!("main.count.global.token_request_reattempts");
                 // We sleep to avoid spamming attempts, such as when the daemon is not running.
                 tokio::time::sleep_until(attempt_timeout).await;
             }
             Err(tokio::time::error::Elapsed { .. }) => {
                 tracing::warn!("RPC to token daemon timed out, will retry now.");
-                DATADOG.incr(TOKEN_REQ_REATTEMPT, crate::logger::NO_TAGS).or_log();
+                dd_incr!("main.count.global.token_request_reattempts");
             }
         }
     }

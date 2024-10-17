@@ -1,29 +1,19 @@
 //! Signup create endpoint.
 
-use super::user_status;
 use crate::{
-    agents::{
-        camera::{Frame, FrameResolution},
-        image_notary::IdentificationImages,
-    },
     backend::endpoints::SIGNUP_BACKEND_URL,
-    identification::{get_orb_token, ORB_ID, OVERALL_SOFTWARE_VERSION},
-    logger::{DATADOG, NO_TAGS},
+    dd_gauge, dd_timing,
+    identification::{get_orb_token, ORB_ID, ORB_OS_VERSION},
     plans::{
-        biometric_capture::{Capture, EyeCapture},
+        biometric_capture::Capture,
         biometric_pipeline::{EyePipeline, Pipeline},
         qr_scan,
     },
 };
 use eyre::Result;
-use reqwest::multipart::{Form, Part};
+use reqwest::multipart::Form;
 use serde::{Deserialize, Serialize};
-use std::{
-    convert::TryInto,
-    io::Cursor,
-    time::{Duration, SystemTime},
-};
-use tokio::task;
+use std::time::SystemTime;
 
 /// The "codes" request form field from the V2 pipeline.
 #[derive(Serialize, Debug)]
@@ -85,9 +75,9 @@ pub enum SignupReason {
     /// Signup was successfully processed on the Orb.
     #[default]
     Normal,
-    /// Signup failed due to some agent dying or some internal error.
+    /// Signup failed due to some agent dying in the biometric pipeline or some internal error.
     Failure,
-    /// Signup was detected as a fraud attempt.
+    /// Signup was detected as a fraud attempt at the orb (not to be confused with the backend fraud checks).
     Fraud,
 }
 
@@ -112,59 +102,35 @@ pub async fn request(
     signup_id: &str,
     operator_qr_code: &qr_scan::user::Data,
     user_qr_code: &qr_scan::user::Data,
-    user_data: &user_status::UserData,
     s3_region: &str,
     capture: &Capture,
     pipeline: Option<&Pipeline>,
-    identification_image_ids: Option<&IdentificationImages>,
     signup_reason: SignupReason,
 ) -> Result<Response> {
-    DATADOG.gauge(
-        "orb.main.gauge.signup.sharpest_iris",
+    dd_gauge!(
+        "main.gauge.signup.sharpest_iris",
         capture.eye_left.ir_net_estimate.score.to_string(),
-        ["side:left"],
-    )?;
-    DATADOG.gauge(
-        "orb.main.gauge.signup.sharpest_iris",
+        "side:left"
+    );
+    dd_gauge!(
+        "main.gauge.signup.sharpest_iris",
         capture.eye_right.ir_net_estimate.score.to_string(),
-        ["side:right"],
-    )?;
-    let opt_in = user_data.data_policy.is_opt_in() && identification_image_ids.is_some();
-    if user_data.data_policy.is_opt_in() {
-        DATADOG.incr("orb.main.count.data_collection.opt_in", NO_TAGS)?;
-    } else {
-        DATADOG.incr("orb.main.count.data_collection.opt_out", NO_TAGS)?;
-    }
-    tracing::info!("Overall software version: {:?}", &*OVERALL_SOFTWARE_VERSION);
+        "side:right"
+    );
+    tracing::info!("Orb OS version: {:?}", &*ORB_OS_VERSION);
     tracing::info!("Signup reason: {:?}", signup_reason);
     let codes = pipeline.map_or(String::new(), |p| {
         serde_json::to_string_pretty(&format_pipeline(p)).expect("always a valid JSON")
     });
     let mut form = Form::new()
-        .text("softwareVersion", &*OVERALL_SOFTWARE_VERSION)
+        .text("softwareVersion", &*ORB_OS_VERSION)
         .text("orbId", ORB_ID.as_str())
         .text("distributorId", operator_qr_code.user_id.clone())
         .text("userId", user_qr_code.user_id.clone())
         .text("region", s3_region.to_owned())
-        .text("optIn", if opt_in { "true" } else { "false" })
         .text("signature", signature.map_or(String::default(), Clone::clone))
         .text("codes", codes)
         .text("reason", signup_reason.to_screaming_snake_case().to_string());
-    if opt_in {
-        let (iris_left, iris_right, faces) =
-            encode_images(capture.eye_left.clone(), capture.eye_right.clone()).await?;
-        form = form.part("irisLeftImages", iris_left).part("irisRightImages", iris_right);
-        for face in faces {
-            form = form.part("faceImages", face);
-        }
-        if let Some(identification_image_ids) = identification_image_ids {
-            form = form
-                .text("irLeftImageId", identification_image_ids.left_ir.to_string())
-                .text("irRightImageId", identification_image_ids.right_ir.to_string())
-                .text("faceOneImageId", identification_image_ids.left_rgb.to_string())
-                .text("faceTwoImageId", identification_image_ids.right_rgb.to_string());
-        }
-    }
     if let Some(latitude) = capture.latitude {
         form = form.text("latitude", latitude.to_string());
     }
@@ -186,47 +152,12 @@ pub async fn request(
     tracing::debug!("Received response {:#?}", response);
     response.error_for_status_ref()?;
     let response = response.json::<Response>().await?;
-    DATADOG.timing(
-        "orb.main.time.http.signup_request",
-        t.elapsed().unwrap_or(Duration::MAX).as_millis().try_into()?,
-        NO_TAGS,
-    )?;
+    dd_timing!("main.time.http.signup_request", t);
     if let Some(request_size) = request_size {
-        DATADOG.gauge(
-            "orb.main.time.http.signup_request_size",
-            request_size.to_str().unwrap_or("0"),
-            NO_TAGS,
-        )?;
+        dd_gauge!("main.time.http.signup_request_size", request_size.to_str().unwrap_or("0"));
     }
     tracing::debug!("Received response {:#?}", response);
     Ok(response)
-}
-
-async fn encode_images(
-    eye_left: EyeCapture,
-    eye_right: EyeCapture,
-) -> Result<(Part, Part, Vec<Part>)> {
-    task::spawn_blocking(move || -> Result<_> {
-        let mut left_ir_png = Cursor::new(Vec::new());
-        let mut left_rgb_png = Cursor::new(Vec::new());
-        let mut right_ir_png = Cursor::new(Vec::new());
-        let mut right_rgb_png = Cursor::new(Vec::new());
-        eye_left.ir_frame.write_png(&mut left_ir_png, FrameResolution::MAX)?;
-        eye_left.rgb_frame.write_png(&mut left_rgb_png, FrameResolution::MEDIUM)?;
-        eye_right.ir_frame.write_png(&mut right_ir_png, FrameResolution::MAX)?;
-        eye_right.rgb_frame.write_png(&mut right_rgb_png, FrameResolution::LOW)?;
-        Ok((
-            Part::bytes(left_ir_png.into_inner())
-                .file_name(format!("l_{}.png", eye_left.ir_net_estimate.score)),
-            Part::bytes(right_ir_png.into_inner())
-                .file_name(format!("r_{}.png", eye_right.ir_net_estimate.score)),
-            vec![
-                Part::bytes(left_rgb_png.into_inner()).file_name("f_0.png"),
-                Part::bytes(right_rgb_png.into_inner()).file_name("f_1.png"),
-            ],
-        ))
-    })
-    .await?
 }
 
 /// Serializes pipeline outputs into backend format.

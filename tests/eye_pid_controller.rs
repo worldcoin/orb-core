@@ -23,8 +23,8 @@ fn test_pid() {
             setpoint = 100.0;
         }
         let dt = timer.get_dt().unwrap_or(0.0);
-        let (control, _) = controller.update((setpoint - process) * 20.0, 0.0, dt);
-        process = control;
+        let (control, _) = controller.update((process - setpoint) * 20.0, 0.0, dt);
+        process = control * 2.0; // multiply by two because pid.gnuplot was created with the old horizontal/vertical mirror angle definition
         setpoint_history.push(setpoint);
         process_history.push(process);
     }

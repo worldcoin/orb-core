@@ -1,42 +1,40 @@
 //! Network monitor.
-
+//! Ping remote host using ICMP PING packets and report the round-trip time.
+//! Use ICMP PING sockets <https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/commit/?id=c319b4d76b9e583a5d88d6bf190e079c4e43213d>
 use crate::{
     backend::endpoints::NETWORK_MONITOR_HOST,
     config::Config,
+    network::WPA_SUPPLICANT_INTERFACE_BIN,
     pid::{derivative::LowPassFilter, InstantTimer, Timer},
+    process::Command,
     utils::spawn_named_thread,
 };
 use eyre::{bail, Result, WrapErr};
 use futures::{channel::oneshot, prelude::*, ready};
 use pnet::{
+    datalink,
     packet::{
         icmp::{
             echo_reply::EchoReplyPacket as EchoReplyPacketV4,
-            echo_request::MutableEchoRequestPacket as MutableEchoRequestPacketV4, IcmpPacket,
-            IcmpType, IcmpTypes,
+            echo_request::MutableEchoRequestPacket as MutableEchoRequestPacketV4,
+            IcmpCode as IcmpCodeV4, IcmpTypes as Icmpv4Types,
         },
         icmpv6::{
             echo_reply::EchoReplyPacket as EchoReplyPacketV6,
-            echo_request::MutableEchoRequestPacket as MutableEchoRequestPacketV6, Icmpv6Packet,
-            Icmpv6Type, Icmpv6Types,
+            echo_request::MutableEchoRequestPacket as MutableEchoRequestPacketV6,
+            Icmpv6Code as IcmpCodeV6, Icmpv6Types,
         },
-        ip::IpNextHeaderProtocols,
         Packet,
     },
-    transport::{
-        icmp_packet_iter, icmpv6_packet_iter, transport_channel, TransportChannelType,
-        TransportProtocol, TransportReceiver, TransportSender,
-    },
-    util,
 };
-use rand::random;
+use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 use std::{
     io,
-    net::{IpAddr, ToSocketAddrs},
+    io::Read,
+    net::{IpAddr, SocketAddr, ToSocketAddrs},
     pin::Pin,
-    process::Command,
     str,
-    sync::{mpsc, Arc},
+    sync::Arc,
     task::{Context, Poll},
     thread,
     time::{Duration, Instant},
@@ -89,13 +87,8 @@ pub struct Report {
     pub rssi: i64,
     /// WiFi SSID name.
     pub ssid: String,
-}
-
-struct Reply {
-    addr: IpAddr,
-    identifier: u16,
-    sequence_number: u16,
-    timestamp: Instant,
+    /// Mac address of the WiFi interface.
+    pub mac_address: String,
 }
 
 impl Monitor for Jetson {
@@ -160,30 +153,12 @@ impl Jetson {
     pub fn spawn_with_trigger(config: Arc<Mutex<Config>>) -> Result<(Self, Trigger)> {
         let (trigger_tx, trigger_rx) = oneshot::channel();
         let (report_tx, report_rx) = broadcast::channel(REPORT_CAPACITY);
-        let (listen_tx, listen_rx) = mpsc::channel();
-        let (mut icmpv4_transport_tx, mut icmpv4_transport_rx) = icmpv4_transport()?;
-        let (mut icmpv6_transport_tx, mut icmpv6_transport_rx) = icmpv6_transport()?;
         let report_tx2 = report_tx.clone();
-        let listen_tx2 = listen_tx.clone();
         task::spawn(async move {
             if trigger_rx.await.is_ok() {
                 spawn_named_thread("monitor-net", move || {
-                    main_loop(
-                        &mut icmpv4_transport_tx,
-                        &mut icmpv6_transport_tx,
-                        &report_tx2,
-                        &listen_rx,
-                        &config,
-                    );
+                    main_loop(&report_tx2, &config);
                     tracing::warn!("Network monitor main loop exited");
-                });
-                spawn_named_thread("monitor-net-ipv4", move || {
-                    listen_v4_loop(&mut icmpv4_transport_rx, &listen_tx);
-                    tracing::warn!("Network monitor listen loop exited");
-                });
-                spawn_named_thread("monitor-net-ipv6", move || {
-                    listen_v6_loop(&mut icmpv6_transport_rx, &listen_tx2);
-                    tracing::warn!("Network monitor listen loop exited");
                 });
             }
         });
@@ -192,6 +167,18 @@ impl Jetson {
             Self { report_tx, report_rx: BroadcastStream::new(report_rx), last_report: None },
             Trigger(trigger_tx),
         ))
+    }
+}
+
+impl Fake {
+    /// Creates a new fake network monitor with an external trigger.
+    #[must_use]
+    pub fn spawn_with_trigger() -> (Self, Trigger) {
+        let (trigger_tx, trigger_rx) = oneshot::channel();
+        task::spawn(async move {
+            let _ = trigger_rx.await;
+        });
+        (Self, Trigger(trigger_tx))
     }
 }
 
@@ -235,220 +222,41 @@ impl Report {
     }
 }
 
-impl Reply {
-    fn try_from_raw_v4((packet, addr): (IcmpPacket, IpAddr)) -> Option<Self> {
-        let icmp_type = packet.get_icmp_type();
-        if icmp_type != IcmpType::new(0) {
-            tracing::trace!(
-                "ICMP packet with unexpected type {icmp_type:?} received from {addr:?}"
-            );
-            return None;
-        }
-        if let Some(echo_reply) = EchoReplyPacketV4::new(packet.packet()) {
-            return Some(Reply {
-                addr,
-                identifier: echo_reply.get_identifier(),
-                sequence_number: echo_reply.get_sequence_number(),
-                timestamp: Instant::now(),
-            });
-        }
-        None
-    }
-
-    fn try_from_raw_v6((packet, addr): (Icmpv6Packet, IpAddr)) -> Option<Self> {
-        let icmp_type = packet.get_icmpv6_type();
-        // looking for type 129 "Echo Reply"
-        if icmp_type != Icmpv6Type::new(129) {
-            tracing::trace!(
-                "ICMP packet with unexpected type {icmp_type:?} received from {addr:?}"
-            );
-            return None;
-        }
-        if let Some(echo_reply) = EchoReplyPacketV6::new(packet.packet()) {
-            return Some(Reply {
-                addr,
-                identifier: echo_reply.get_identifier(),
-                sequence_number: echo_reply.get_sequence_number(),
-                timestamp: Instant::now(),
-            });
-        }
-        None
-    }
-}
-
-/// Makes a single ping to the backend server.
-#[must_use]
-pub fn ping() -> Option<Instant> {
-    let addr = resolve_addr()?;
-    match addr {
-        IpAddr::V4(_) => ping_ipv4(addr),
-        IpAddr::V6(_) => ping_ipv6(addr),
-    }
-}
-
-fn ping_ipv4(addr: IpAddr) -> Option<Instant> {
-    let (mut transport_tx, mut transport_rx) = match icmpv4_transport() {
-        Ok(transport) => transport,
-        Err(err) => {
-            tracing::error!("Couldn't initialize ICMP transport: {err:?}");
-            return None;
-        }
-    };
-    let mut iter = icmp_packet_iter(&mut transport_rx);
-    let mut buf = vec![0; 16];
-    let sequence_number = 0;
-    let identifier = random();
-    match transport_tx.send_to(echo_request_v4(&mut buf, sequence_number, identifier), addr) {
-        Ok(_) => {
-            let start = Instant::now();
-            let mut timeout = NO_INTERNET_THRESHOLD;
-            while !timeout.is_zero() {
-                match iter.next_with_timeout(timeout) {
-                    Ok(packet) => {
-                        if let Some(reply) = Reply::try_from_raw_v4(packet?) {
-                            if reply.sequence_number == sequence_number
-                                && reply.identifier == identifier
-                                && reply.addr == addr
-                            {
-                                return Some(reply.timestamp);
-                            }
-                        }
-                    }
-                    Err(err) => tracing::debug!("Couldn't receive ICMP packet: {err:?}"),
-                }
-                timeout = timeout.saturating_sub(start.elapsed());
-            }
-        }
-        Err(err) => {
-            tracing::debug!("Couldn't send ICMP packet: {err:?}");
-        }
-    }
-    None
-}
-
-fn ping_ipv6(addr: IpAddr) -> Option<Instant> {
-    let (mut transport_tx, mut transport_rx) = match icmpv6_transport() {
-        Ok(transport) => transport,
-        Err(err) => {
-            tracing::error!("Couldn't initialize ICMP transport: {err:?}");
-            return None;
-        }
-    };
-    let mut iter = icmpv6_packet_iter(&mut transport_rx);
-    let mut buf = vec![0; 16];
-    let sequence_number = 0;
-    let identifier = random();
-    match transport_tx.send_to(echo_request_v6(&mut buf, sequence_number, identifier), addr) {
-        Ok(_) => {
-            let start = Instant::now();
-            let mut timeout = NO_INTERNET_THRESHOLD;
-            while !timeout.is_zero() {
-                match iter.next_with_timeout(timeout) {
-                    Ok(packet) => {
-                        if let Some(reply) = Reply::try_from_raw_v6(packet?) {
-                            if reply.sequence_number == sequence_number
-                                && reply.identifier == identifier
-                                && reply.addr == addr
-                            {
-                                return Some(reply.timestamp);
-                            }
-                        }
-                    }
-                    Err(err) => tracing::debug!("Couldn't receive ICMP packet: {err:?}"),
-                }
-                timeout = timeout.saturating_sub(start.elapsed());
-            }
-        }
-        Err(err) => {
-            tracing::debug!("Couldn't send ICMP packet: {err:?}");
-        }
-    }
-    None
+/// Makes a single ping-pong with the backend server.
+pub fn ping(remote: &str) -> io::Result<f64> {
+    let mut socket = PingSocket::new(remote)?;
+    socket.ping()
 }
 
 #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
-fn main_loop(
-    icmpv4_transport_tx: &mut TransportSender,
-    icmpv6_transport_tx: &mut TransportSender,
-    report_tx: &broadcast::Sender<Report>,
-    listen_rx: &mpsc::Receiver<Reply>,
-    config: &Arc<Mutex<Config>>,
-) {
+fn main_loop(report_tx: &broadcast::Sender<Report>, config: &Arc<Mutex<Config>>) {
     let mut lag_timer = InstantTimer::default();
     let mut lag_filter = LowPassFilter::default();
     let mut rssi_timer = InstantTimer::default();
     let mut rssi_filter = LowPassFilter::default();
     let mut ssid = String::new();
-    let mut sequence_number = 0;
-    let identifier = random();
-    let addr = loop {
-        if let Some(addr) = resolve_addr() {
-            break addr;
+    let mut sequence_number: u16 = 0;
+
+    let mut socket = loop {
+        if let Ok(socket) = PingSocket::new(&NETWORK_MONITOR_HOST) {
+            break socket;
         }
         thread::sleep(DELAY_BETWEEN_RESOLVES);
     };
-    tracing::info!("{} resolved to {addr:?}", *NETWORK_MONITOR_HOST);
 
     // Create Tokio runtime once and reuse it.
     let rt = runtime::Builder::new_current_thread().enable_all().build().unwrap();
 
-    'outer: loop {
-        let request_timestamp = Instant::now();
-        let mut buf = vec![0; 16];
-        let result = match addr {
-            IpAddr::V4(_) => icmpv4_transport_tx
-                .send_to(echo_request_v4(&mut buf, sequence_number, identifier), addr),
-            IpAddr::V6(_) => icmpv6_transport_tx
-                .send_to(echo_request_v6(&mut buf, sequence_number, identifier), addr),
-        };
-        let reply_timestamp = match result {
-            Ok(_) => loop {
-                match listen_rx.recv_timeout(NO_INTERNET_THRESHOLD) {
-                    Ok(reply) => {
-                        if reply.sequence_number != sequence_number {
-                            tracing::trace!(
-                                "ICMP packet with unexpected sequence number {:?} received from \
-                                 {:?}",
-                                reply.sequence_number,
-                                reply.addr
-                            );
-                            continue;
-                        }
-                        if reply.identifier != identifier {
-                            tracing::trace!(
-                                "ICMP packet with unexpected identifier {:?} received from {:?}",
-                                reply.identifier,
-                                reply.addr
-                            );
-                            continue;
-                        }
-                        if reply.addr != addr {
-                            tracing::trace!(
-                                "ICMP packet received from {:?} while {:?} was expected",
-                                reply.addr,
-                                addr
-                            );
-                            continue;
-                        }
-                        break Some(reply.timestamp);
-                    }
-                    Err(mpsc::RecvTimeoutError::Timeout) => break None,
-                    Err(mpsc::RecvTimeoutError::Disconnected) => break 'outer,
-                }
-            },
+    loop {
+        let lag = match socket.ping() {
+            Ok(lag) => lag,
             Err(err) => {
-                tracing::debug!("Couldn't send ICMP packet: {err:?}");
-                None
+                tracing::debug!("Failed to ping remote host {0}: {err:?}", &*NETWORK_MONITOR_HOST);
+                NO_INTERNET_THRESHOLD.as_secs_f64() * 1.25
             }
         };
-
-        let lag = reply_timestamp
-            .map_or(NO_INTERNET_THRESHOLD.as_secs_f64() * 1.25, |reply_timestamp| {
-                reply_timestamp.duration_since(request_timestamp).as_secs_f64()
-            });
         let dt = lag_timer.get_dt().unwrap_or(0.0);
         let lag = lag_filter.add(lag, dt, LAG_FILTER_RC);
-
         let rssi = poll_rssi().map_or_else(
             |err| {
                 tracing::debug!("Couldn't poll signal strength: {err}");
@@ -469,54 +277,24 @@ fn main_loop(
         // Get what we want from the config and drop the mutex fast.
         let slow_internet_ping_threshold = rt.block_on(config.lock()).slow_internet_ping_threshold;
         if report_tx
-            .send(Report { lag, slow_internet_ping_threshold, rssi, ssid: ssid.clone() })
+            .send(Report {
+                lag,
+                slow_internet_ping_threshold,
+                rssi,
+                ssid: ssid.clone(),
+                mac_address: mac_address().unwrap_or_default(),
+            })
             .is_err()
         {
-            break 'outer;
+            break;
         }
-        sequence_number = sequence_number.wrapping_add(1);
         thread::sleep(DELAY_BETWEEN_REQUESTS);
-    }
-}
-
-fn listen_v4_loop(transport_rx: &mut TransportReceiver, listen_tx: &mpsc::Sender<Reply>) {
-    let mut iter = icmp_packet_iter(transport_rx);
-    loop {
-        match iter.next() {
-            Ok(packet) => {
-                if let Some(reply) = Reply::try_from_raw_v4(packet) {
-                    if listen_tx.send(reply).is_err() {
-                        break;
-                    }
-                }
-            }
-            Err(err) => {
-                tracing::debug!("Couldn't receive ICMP packet: {err:?}");
-            }
-        }
-    }
-}
-
-fn listen_v6_loop(transport_rx: &mut TransportReceiver, listen_tx: &mpsc::Sender<Reply>) {
-    let mut iter = icmpv6_packet_iter(transport_rx);
-    loop {
-        match iter.next() {
-            Ok(packet) => {
-                if let Some(reply) = Reply::try_from_raw_v6(packet) {
-                    if listen_tx.send(reply).is_err() {
-                        break;
-                    }
-                }
-            }
-            Err(err) => {
-                tracing::debug!("Couldn't receive ICMP packet: {err:?}");
-            }
-        }
+        sequence_number = sequence_number.wrapping_add(1);
     }
 }
 
 fn poll_rssi() -> Result<i64> {
-    let output = Command::new("wpa-supplicant-interface")
+    let output = Command::new(WPA_SUPPLICANT_INTERFACE_BIN)
         .arg("signal")
         .output()
         .wrap_err("running `wpa-supplicant-interface`")?;
@@ -530,7 +308,7 @@ fn poll_rssi() -> Result<i64> {
 }
 
 fn poll_ssid() -> Result<String> {
-    let output = Command::new("wpa-supplicant-interface")
+    let output = Command::new(WPA_SUPPLICANT_INTERFACE_BIN)
         .arg("ssid")
         .output()
         .wrap_err("running `wpa-supplicant-interface`")?;
@@ -544,55 +322,167 @@ fn poll_ssid() -> Result<String> {
     }
 }
 
-fn resolve_addr() -> Option<IpAddr> {
-    match (NETWORK_MONITOR_HOST.as_str(), 0).to_socket_addrs() {
+struct PingSocket {
+    inner: Socket,
+    addr: SockAddr,
+    sequence_number: u16,
+}
+
+impl PingSocket {
+    fn new(remote: &str) -> io::Result<Self> {
+        let addr = resolve_addr(remote)?;
+        let inner = match addr.ip() {
+            IpAddr::V4(_) => Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::ICMPV4)),
+            IpAddr::V6(_) => Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::ICMPV6)),
+        }?;
+        inner.set_send_buffer_size(324 /* value copied from ping */)?;
+        inner.set_recv_buffer_size(65536 /* value copied from ping */)?;
+        inner.set_read_timeout(Some(NO_INTERNET_THRESHOLD))?;
+        inner.set_write_timeout(Some(NO_INTERNET_THRESHOLD))?;
+        //inner.set_cloexec(true)?;
+        //TODO set inner.SO_TIMESTAMP
+        Ok(Self { inner, addr: SockAddr::from(addr), sequence_number: 0 })
+    }
+
+    /// Send ICMP echo request and wait for the reply.
+    ///
+    /// # Returns
+    /// the round-trip time in seconds.
+    /// `Err(err)` if there was an IO error.
+    fn ping(&mut self) -> io::Result<f64> {
+        let begin = Instant::now();
+
+        self.sequence_number = self.sequence_number.wrapping_add(1);
+
+        self.make_request()?;
+        self.read_reply()?;
+        Ok(begin.elapsed().as_secs_f64())
+    }
+
+    fn make_request(&self) -> io::Result<()> {
+        let mut buf = [0u8; 64];
+        if self.inner.local_addr()?.is_ipv4() {
+            let mut echo_request = MutableEchoRequestPacketV4::new(&mut buf).unwrap();
+            echo_request.set_icmp_type(Icmpv4Types::EchoRequest);
+            echo_request.set_icmp_code(IcmpCodeV4::new(0));
+            echo_request.set_sequence_number(self.sequence_number);
+            self.inner.send_to(echo_request.packet(), &self.addr)?;
+        } else {
+            let mut echo_request = MutableEchoRequestPacketV6::new(&mut buf).unwrap();
+            echo_request.set_icmpv6_type(Icmpv6Types::EchoRequest);
+            echo_request.set_icmpv6_code(IcmpCodeV6::new(0));
+            echo_request.set_sequence_number(self.sequence_number);
+            self.inner.send_to(echo_request.packet(), &self.addr)?;
+        }
+        Ok(())
+    }
+
+    // return sequence number or None
+    fn parse_echo_response(&self, buf: &[u8]) -> Option<u16> {
+        if self.inner.local_addr().ok()?.is_ipv4() {
+            let echo_response = EchoReplyPacketV4::new(buf)?;
+            Some(echo_response.get_sequence_number())
+        } else {
+            let echo_response = EchoReplyPacketV6::new(buf)?;
+            Some(echo_response.get_sequence_number())
+        }
+    }
+
+    fn read_reply(&mut self) -> io::Result<()> {
+        let mut buf = [0u8; 64];
+
+        let begin = Instant::now();
+        loop {
+            match self.inner.read(&mut buf) {
+                Ok(len) => {
+                    if self.parse_echo_response(&buf[0..len]) == Some(self.sequence_number) {
+                        return Ok(());
+                    }
+                    if begin.elapsed() > NO_INTERNET_THRESHOLD {
+                        return Err(io::Error::new(
+                            io::ErrorKind::WouldBlock,
+                            "No ICMP reply received in time",
+                        ));
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!("Error reading ICMP reply: {:?}", err);
+                    return Err(err);
+                }
+            }
+        }
+    }
+}
+
+fn resolve_addr(remote: &str) -> io::Result<SocketAddr> {
+    match (remote, 0).to_socket_addrs() {
         Ok(mut addrs) => {
             if let Some(addr) = addrs.next() {
-                return Some(addr.ip());
+                tracing::trace!("{remote} resolved to {addr}");
+                return Ok(addr);
             }
-            tracing::error!("{} resolved to 0 addresses", *NETWORK_MONITOR_HOST);
+            tracing::error!("{remote} resolved to 0 addresses");
+            Err(io::Error::other(format!("{remote} resolved to 0 addresses")))
         }
-        Err(err) => tracing::error!("Couldn't resolve {}: {err:?}", *NETWORK_MONITOR_HOST),
+        Err(err) => {
+            tracing::error!("Couldn't resolve {remote}: {err:?}");
+            Err(err)
+        }
     }
-    None
 }
 
-fn icmpv4_transport() -> Result<(TransportSender, TransportReceiver), io::Error> {
-    transport_channel(
-        4096,
-        TransportChannelType::Layer4(TransportProtocol::Ipv4(IpNextHeaderProtocols::Icmp)),
-    )
+fn mac_address() -> Option<String> {
+    datalink::interfaces()
+        .iter()
+        .find(|e| e.name == "wlan0")
+        .and_then(|interface| interface.mac)
+        .map(|mac| mac.to_string())
 }
 
-fn icmpv6_transport() -> Result<(TransportSender, TransportReceiver), io::Error> {
-    transport_channel(
-        4096,
-        TransportChannelType::Layer4(TransportProtocol::Ipv6(IpNextHeaderProtocols::Icmpv6)),
-    )
-}
+// Tests are disabled because they require a network, but nix sandboxing doesn't allow it.
+// If you find a way to run these tests, please enable them.
+//
+#[cfg(test)]
+mod tests {
+    use crate::{backend::endpoints::NETWORK_MONITOR_HOST, monitor::net::ping};
 
-fn echo_request_v4(
-    buf: &mut [u8],
-    sequence_number: u16,
-    identifier: u16,
-) -> MutableEchoRequestPacketV4 {
-    let mut echo_request = MutableEchoRequestPacketV4::new(buf).unwrap();
-    echo_request.set_icmp_type(IcmpTypes::EchoRequest);
-    echo_request.set_sequence_number(sequence_number);
-    echo_request.set_identifier(identifier);
-    echo_request.set_checksum(util::checksum(echo_request.packet(), 1));
-    echo_request
-}
+    /// IPv4 has no *official* blackhole address, use a IP range reserved for documentation (TEST-NET-3)
+    /// https://datatracker.ietf.org/doc/html/rfc5735#section-4
+    const BLACKHOLE_LEGACY_IP: &str = "203.0.113.1";
+    /// https://datatracker.ietf.org/doc/html/rfc6666
+    const BLACKHOLE_IP: &str = "0100::1";
 
-fn echo_request_v6(
-    buf: &mut [u8],
-    sequence_number: u16,
-    identifier: u16,
-) -> MutableEchoRequestPacketV6 {
-    let mut echo_request = MutableEchoRequestPacketV6::new(buf).unwrap();
-    echo_request.set_icmpv6_type(Icmpv6Types::EchoRequest);
-    echo_request.set_sequence_number(sequence_number);
-    echo_request.set_identifier(identifier);
-    echo_request.set_checksum(util::checksum(echo_request.packet(), 1));
-    echo_request
+    #[test]
+    #[ignore]
+    fn test_ping_loopback() {
+        assert!(ping("::1").is_ok());
+    }
+
+    #[test]
+    #[ignore]
+    fn test_ping_loopback_legacy_ip() {
+        assert!(ping("127.0.0.1").is_ok());
+    }
+
+    #[test]
+    #[ignore]
+    fn test_ping_success() {
+        assert!(ping(&NETWORK_MONITOR_HOST).is_ok());
+    }
+
+    #[test]
+    #[ignore]
+    fn test_ping_blackhole() {
+        let ret = ping(BLACKHOLE_IP);
+        assert!(ret.is_err());
+        assert_eq!(ret.err().unwrap().kind(), std::io::ErrorKind::WouldBlock);
+    }
+
+    #[test]
+    #[ignore]
+    fn test_ping_blackhole_legacy_ip() {
+        let ret = ping(BLACKHOLE_LEGACY_IP);
+        assert!(ret.is_err());
+        assert_eq!(ret.err().unwrap().kind(), std::io::ErrorKind::WouldBlock);
+    }
 }

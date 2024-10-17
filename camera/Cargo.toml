@@ -2,17 +2,15 @@
 name = "orb-camera"
 version = "0.1.0"
 authors = ["Valentine Valyaeff <valentine.valyaeff@gmail.com>"]
-edition = "2021"
+edition.workspace = true
 license.workspace = true
-
-[dependencies.v4l2-sys]
-path = "../v4l2-sys"
-version = "0.1.0"
+publish = false
 
 [dependencies]
 libc = "0.2.93"
 nix = { version = "0.26", default-features = false, features = ["time"] }
 log.workspace = true
+v4l2-sys.workspace = true
 
 [dev-dependencies]
 futures = "0.3"

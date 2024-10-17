@@ -28,7 +28,7 @@ RUN echo "experimental-features = nix-command flakes" >>"${HOME}/.config/nix/nix
 # https://github.com/NixOS/nix/blob/0eb9946e1d3621cfc2fcffc9378dba334b25fb26/docker.nix#L259-L264
 ENV PATH="${PATH}:/home/vscode/.nix-profile/bin"
 
-RUN nix-env -iA cachix -f https://cachix.org/api/v1/install
+RUN nix-env -iA nixpkgs.cachix
 RUN nix-env -iA nixpkgs.shadow
 RUN nix-env -iA nixpkgs.nix-direnv nixpkgs.nixpkgs-fmt nixpkgs.nil
 RUN nix-env -iA nixpkgs.git-lfs
@@ -73,6 +73,9 @@ RUN /bin/bash /tmp/nix/native.sh echo OK
 # models. In case you see errors in your manual commands on nix (e.g. if you are downloading a new model), use
 # `export GIT_CONFIG_NOSYSTEM=1` or `export GIT_CONFIG_NOGLOBAL=1` to make Nix ignore the global or system git config.
 RUN /bin/bash /tmp/git-config-token.sh ${GITHUB_TOKEN}
+
+ARG CONTAINER_WORKSPACE_FOLDER
+RUN /bin/bash -c "git config --global --add safe.directory ${CONTAINER_WORKSPACE_FOLDER}"
 
 # Downloading Rust index takes time. We cache it during build time.
 RUN /bin/bash /tmp/nix/cross.sh cargo new hello

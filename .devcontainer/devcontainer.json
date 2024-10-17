@@ -2,48 +2,49 @@
 // see the README at:
 // https://github.com/microsoft/vscode-dev-containers/tree/v0.245.2/containers/ubuntu
 {
-	"name": "Ubuntu",
-	"build": {
-		"dockerfile": "Dockerfile",
-		"args": {
-			"CACHIX_AUTH_TOKEN": "${localEnv:CACHIX_AUTH_TOKEN}",
-			"GITHUB_TOKEN": "${localEnv:GITHUB_TOKEN}"
-		},
-		"context": ".."
-	},
-	// Comment out to connect as root instead. More info:
-	// https://aka.ms/vscode-remote/containers/non-root.
-	"remoteUser": "vscode",
-	"containerUser": "vscode",
-	"updateRemoteUserUID": true,	
-	"customizations": {
-		"vscode": {
-			"extensions": [
-				"eamodio.gitlens",
-				"foxundermoon.shell-format",
-				"github.vscode-github-actions",
-				"jnoortheen.nix-ide",
-				"mkhl.direnv",
-				"ms-azuretools.vscode-docker",
-				"mutantdino.resourcemonitor",
-				"rust-lang.rust-analyzer",
-				"ryanluker.vscode-coverage-gutters",
-				"serayuzgur.crates",
-				"stkb.rewrap",
-				"streetsidesoftware.code-spell-checker",
-				"tamasfe.even-better-toml",
-				"timonwong.shellcheck",
-				"yzhang.markdown-all-in-one"
-			]
-		}
-	},
-	"runArgs": [
-		"--env-file",
-		".devcontainer/devcontainer.env"
-	],
-	"mounts": [
-		"source=rust_target_vol,target=${containerWorkspaceFolder}/target,type=volume",
-		"source=${localEnv:HOME}/.ssh,target=/home/vscode/.ssh_mirror,type=bind"
-	],
-	"postCreateCommand": ".devcontainer/postCreateCommand.sh"
+    "name": "Ubuntu",
+    "build": {
+        "dockerfile": "Dockerfile",
+        "args": {
+            "CACHIX_AUTH_TOKEN": "${localEnv:CACHIX_AUTH_TOKEN}",
+            "GITHUB_TOKEN": "${localEnv:GITHUB_TOKEN}",
+            "CONTAINER_WORKSPACE_FOLDER": "${containerWorkspaceFolder}"
+        },
+        "context": ".."
+    },
+    // Comment out to connect as root instead. More info:
+    // https://aka.ms/vscode-remote/containers/non-root.
+    "remoteUser": "vscode",
+    "containerUser": "vscode",
+    "updateRemoteUserUID": true,
+    "customizations": {
+        "vscode": {
+            "extensions": [
+                "eamodio.gitlens",
+                "fill-labs.dependi",
+                "foxundermoon.shell-format",
+                "github.vscode-github-actions",
+                "jnoortheen.nix-ide",
+                "mkhl.direnv",
+                "ms-azuretools.vscode-docker",
+                "mutantdino.resourcemonitor",
+                "rust-lang.rust-analyzer",
+                "ryanluker.vscode-coverage-gutters",
+                "stkb.rewrap",
+                "streetsidesoftware.code-spell-checker",
+                "tamasfe.even-better-toml",
+                "timonwong.shellcheck",
+                "yzhang.markdown-all-in-one"
+            ]
+        }
+    },
+    "runArgs": [
+        "--env-file",
+        ".devcontainer/devcontainer.env"
+    ],
+    "mounts": [
+        "source=rust_target_vol,target=${containerWorkspaceFolder}/target,type=volume",
+        "source=${localEnv:HOME}/.ssh,target=/home/vscode/.ssh_mirror,type=bind"
+    ],
+    "postCreateCommand": ".devcontainer/postCreateCommand.sh"
 }

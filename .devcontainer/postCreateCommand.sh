@@ -2,7 +2,7 @@
 
 set -eux
 
-sudo chown -R vscode /workspaces/orb-core || true
+sudo chown -R vscode /workspaces/priv-orb-core || true
 
 # We don't directly mount the ssh directory, as we only wish to link certain files in .ssh
 # So, we mount it at ~/.ssh_mirror and symlink only certain files.

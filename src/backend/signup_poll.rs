@@ -48,9 +48,8 @@ pub async fn request(signup_id: &str) -> Result<Response> {
 
     let response_body = response.text().await?;
     let parsed_response = serde_json::from_str::<Response>(&response_body)
-        .map_err(|e| {
+        .inspect_err(|_| {
             tracing::error!("Failed to parse response JSON. Response body: {:#?}", response_body);
-            e
         })
         .wrap_err("Failed to parse response JSON")?;
 

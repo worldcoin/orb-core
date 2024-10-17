@@ -2,6 +2,8 @@
 //!
 //! This needs to be a seperate and minimal binary,
 //! since it is going to have the SETUID/SETGID bit set
+//!
+//! <https://www.notion.so/worldcoin/Fuse-Burning-eb91c53aa4a84db481f93a64290c46f5#b96ab8dc3a85421a91343f4c9b4c64b9>
 
 #![warn(clippy::pedantic)]
 #![allow(clippy::doc_markdown, clippy::missing_errors_doc)]

@@ -3,22 +3,26 @@
 #![allow(clippy::used_underscore_binding)] // triggered by rkyv
 
 use crate::{
-    agents::{camera::rgb::Frame, AgentProcessExitStrategy},
+    agents::{camera::rgb::Frame, ProcessInitializer},
     consts::{RGB_NATIVE_HEIGHT, RGB_NATIVE_WIDTH},
+};
+use agentwire::{
+    agent,
     port::{Port, RemoteInner, SharedPort},
 };
-use eyre::Result;
+use eyre::{Error, Result};
 use image::{DynamicImage, RgbImage};
 use rkyv::{Archive, Deserialize, Serialize};
 use rxing::{
     common::HybridBinarizer, qrcode::cpp_port::QrReader, BinaryBitmap,
     BufferedImageLuminanceSource, Reader,
 };
+use std::mem::size_of;
 
 /// QR-code reader from the RGB camera.
 ///
 /// See [the module-level documentation](self) for details.
-#[derive(Default, Clone, Debug, Archive, Serialize, Deserialize)]
+#[derive(Clone, Debug, Archive, Serialize, Deserialize)]
 pub struct Agent {}
 
 /// Qr-code reader output.
@@ -51,18 +55,21 @@ impl Port for Agent {
 }
 
 impl SharedPort for Agent {
-    const SERIALIZED_CONFIG_EXTRA_SIZE: usize = 0;
+    const SERIALIZED_INIT_SIZE: usize =
+        size_of::<usize>() + size_of::<<Agent as Archive>::Archived>();
     const SERIALIZED_INPUT_SIZE: usize =
         4096 + RGB_NATIVE_HEIGHT as usize * RGB_NATIVE_WIDTH as usize * 3;
     const SERIALIZED_OUTPUT_SIZE: usize = 4096;
 }
 
-impl super::Agent for Agent {
+impl agentwire::Agent for Agent {
     const NAME: &'static str = "qr-code";
 }
 
-impl super::AgentProcess for Agent {
-    fn run(self, mut port: RemoteInner<Self>) -> Result<()> {
+impl agentwire::agent::Process for Agent {
+    type Error = Error;
+
+    fn run(self, mut port: RemoteInner<Self>) -> Result<(), Self::Error> {
         let mut qr_scanner = QrReader;
         loop {
             let input = port.recv();
@@ -77,7 +84,7 @@ impl super::AgentProcess for Agent {
                         Ok(output) => {
                             tracing::debug!("Decoded QR-code with rxing: {:?}", output.payload);
                             let chain = input.chain_fn();
-                            port.try_send(chain(output));
+                            port.try_send(&chain(output));
                         }
                         Err(e) => {
                             if !matches!(e, rxing::Exceptions::NotFoundException(_)) {
@@ -91,10 +98,14 @@ impl super::AgentProcess for Agent {
         }
     }
 
-    fn exit_strategy(_code: Option<i32>, _signal: Option<i32>) -> AgentProcessExitStrategy {
+    fn exit_strategy(_code: Option<i32>, _signal: Option<i32>) -> agent::process::ExitStrategy {
         // Because crashes are deterministic for this agent, we will not retry
         // bad inputs.
-        AgentProcessExitStrategy::Restart
+        agent::process::ExitStrategy::Restart
+    }
+
+    fn initializer() -> impl agent::process::Initializer {
+        ProcessInitializer::default()
     }
 }
 

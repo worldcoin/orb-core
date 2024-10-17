@@ -10,7 +10,7 @@ fn main() -> Result<()> {
         .header("wrapper.h")
         .clang_args(env::var("EXTRA_CLANG_CFLAGS")?.split_ascii_whitespace())
         .clang_args(env::var("NIX_CFLAGS_COMPILE")?.split_ascii_whitespace())
-        .parse_callbacks(Box::new(bindgen::CargoCallbacks))
+        .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))
         .derive_debug(true)
         .impl_debug(true)
         .generate()?;

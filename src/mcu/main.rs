@@ -1,22 +1,18 @@
 //! Main microcontroller interface.
 
-use super::{can::Can, serial::Serial, Interface, Mcu, ResultSender};
+use super::{can::Can, Interface, Mcu, ResultSender};
 use crate::{
     consts::{DEFAULT_USER_LED_PULSING_PERIOD, DEFAULT_USER_LED_PULSING_SCALE},
-    ext::mpsc::SenderExt,
     time_series::TimeSeries,
 };
 use eyre::Result;
 use futures::{channel::mpsc, prelude::*, stream::Fuse};
 use libc::CAN_EFF_FLAG;
 use nmea_parser::NmeaParser;
-use orb_messages;
+use orb_messages::mcu_main::MirrorAngleType;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use std::{
-    fmt::{self, Debug},
-    ops,
-};
+use std::fmt::{self, Debug};
 use tokio::sync::broadcast;
 use tokio_stream::wrappers::BroadcastStream;
 
@@ -48,13 +44,14 @@ pub struct RgbLed {
     red: u8,
     green: u8,
     blue: u8,
+    dimming: Option<u8>,
 }
 
 impl RgbLed {
-    /// Constructs a new `RgbLed` with `red`, `green`, and `blue` values.
+    /// Constructs a new `RgbLed` with `red`, `green`, and `blue` values and optional `dimming`.
     #[must_use]
-    pub const fn new(red: u8, green: u8, blue: u8) -> Self {
-        Self { red, green, blue }
+    pub const fn new(red: u8, green: u8, blue: u8, dimming: Option<u8>) -> Self {
+        Self { red, green, blue, dimming }
     }
 }
 
@@ -66,7 +63,6 @@ pub struct Main;
 pub struct Jetson {
     log: Option<Log>,
     input_tx: mpsc::Sender<(Input, Option<ResultSender>)>,
-    serial_input_tx: mpsc::Sender<Input>,
     output_tx: broadcast::Sender<Output>,
     output_rx: Fuse<BroadcastStream<Output>>,
 }
@@ -127,7 +123,7 @@ pub enum Input {
     /// Control on duration of IR LEDs after trigger.
     IrLedDuration(u16),
     /// Same as IrLedDuration, but for 740nm (larger maximum duty cycle).
-    IrLedDuration740nm(u16),
+    IrLedDuration740nm(u16), // deprecated; 740 nm are not mounted on Pearl EV6 (and later) and on Diamond B3 (and later)
     /// Control brightness of front-mounted User LEDs.
     UserLedBrightness(u8),
     /// Set pattern of front-mounted User LEDs.
@@ -149,7 +145,7 @@ pub enum Input {
     /// Sends the internal jetson temperature for the fan control.
     Temperature(u16),
     /// Set mirror angle.
-    Mirror(u32, i32),
+    Mirror(u32, u32),
     /// Set mirror angle relative to its current position.
     MirrorRelative(i32, i32),
     /// Perform Mirror Autohoming.
@@ -169,12 +165,14 @@ pub enum Input {
     VoltageRequestPeriod(u32),
     /// Request Value.
     ValueGet(Property),
-    // FIXME: next inputs are obsolete and used only by orb-control-api for
-    // testing purposes.
     /// Control brightness of front-mounted User LEDs.
     OperatorLedBrightness(u8),
     /// Set pattern of front-mounted User LEDs.
     OperatorLedPattern(OperatorLedControl),
+    /// Set pattern of cone LEDs. (diamond only)
+    ConeLedPattern(ConeLedControl),
+    /// Set brightness of white LEDs in thousandth. (diamond only)
+    WhiteLedBrightness(u32),
     /// Set the focus values (target current in mA) for the liquid lens to be
     /// used during a focus sweep operation.
     IrEyeCameraFocusSweepValuesPolynomial(FocusSweepPolynomial),
@@ -220,6 +218,8 @@ pub enum Output {
     BatteryInfoSocAndStatistics(orb_messages::mcu_main::BatteryInfoSocAndStatistics),
     /// Battery diagnostics.
     BatteryInfoMaxValues(orb_messages::mcu_main::BatteryInfoMaxValues),
+    /// Battery state of health
+    BatteryStateOfHealth(orb_messages::mcu_main::BatteryStateOfHealth),
     /// Mirror range.
     MotorRange(orb_messages::mcu_main::MotorRange),
     /// Fan status.
@@ -231,7 +231,7 @@ pub enum Output {
     /// MCU Logs.
     Logs(String),
     /// Firmware versions in primary and secondary slots.
-    Versions(super::main::Versions),
+    Versions(Versions),
     /// 1D ToF distance in mm.
     TofDistance(u32),
     /// State of hardware component
@@ -321,41 +321,21 @@ pub enum IrLed {
     /// None
     #[serde(rename = "None")]
     None,
+    /// 850 nm center
+    #[serde(rename = "850_center")]
+    L850Center,
+    /// 850 nm side
+    #[serde(rename = "850_side")]
+    L850Side,
+    /// 940 nm single
+    #[serde(rename = "940_single")]
+    L940Single,
 }
 
 /// RGB LED color.
+/// Diamond's RGB LEDs allow setting a forth value: the dimming value.
 #[derive(Eq, PartialEq, Copy, Clone, Default, Debug, Serialize, Deserialize)]
-pub struct Rgb(pub u8, pub u8, pub u8);
-
-impl ops::Mul<f64> for Rgb {
-    type Output = Self;
-
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    fn mul(self, rhs: f64) -> Self::Output {
-        Rgb(
-            (f64::from(self.0) * rhs) as u8,
-            (f64::from(self.1) * rhs) as u8,
-            (f64::from(self.2) * rhs) as u8,
-        )
-    }
-}
-
-impl ops::MulAssign<f64> for Rgb {
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    fn mul_assign(&mut self, rhs: f64) {
-        self.0 = (f64::from(self.0) * rhs) as u8;
-        self.1 = (f64::from(self.1) * rhs) as u8;
-        self.2 = (f64::from(self.2) * rhs) as u8;
-    }
-}
-
-impl ops::Add for Rgb {
-    type Output = Self;
-
-    fn add(self, rhs: Self) -> Self::Output {
-        Rgb(self.0 + rhs.0, self.1 + rhs.1, self.2 + rhs.2)
-    }
-}
+pub struct Rgb(pub u8, pub u8, pub u8, pub Option<u8>);
 
 /// User Led Patterns.
 #[derive(Copy, Clone, Debug, Serialize, Deserialize)]
@@ -382,6 +362,19 @@ pub enum UserLedPattern {
     CustomRgb(Rgb),
     /// Custom RGB color
     PulsingCustomRgb(Rgb, f32, u32),
+    /// Custom RGB color
+    PulsingCustomRgbOnlyCenter(Rgb, f32, u32),
+    /// Custom RGB color
+    CustomRgbOnlyCenter(Rgb),
+}
+
+/// Cone Led Patterns.
+#[derive(Copy, Clone, Debug, Serialize, Deserialize)]
+pub enum ConeLedPattern {
+    /// Off.
+    Off,
+    /// Custom RGB color
+    CustomRgb(Rgb),
 }
 
 /// User LED control
@@ -423,6 +416,13 @@ pub struct OperatorLedControl {
     pub mask: u32,
 }
 
+/// Cone LED control
+#[derive(Copy, Clone, Debug, Serialize, Deserialize)]
+pub struct ConeLedControl {
+    /// Pattern
+    pub pattern: ConeLedPattern,
+}
+
 /// Modes for mirror autohoming.
 #[derive(Copy, Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum MirrorHomingMode {
@@ -438,9 +438,9 @@ pub enum MirrorHomingAngle {
     /// Perform autohoming on both angles at the same time.
     Both,
     /// Perform autohoming on the vertical angle only.
-    Vertical,
+    VerticalTheta,
     /// Perform autohoming on the horizontal angle only.
-    Horizontal,
+    HorizontalPhi,
 }
 
 /// Property to get from the main microcontroller firmware
@@ -521,11 +521,12 @@ impl Interface for Main {
             Input::IrLed(ir_led) => {
                 log.ir_led.push(ir_led);
             }
-            Input::Mirror(x, y) => {
-                log.mirror.push((x, y));
+            Input::Mirror(phi_angle_degrees, theta_angle_degrees) => {
+                #[allow(clippy::cast_possible_wrap)]
+                log.mirror.push((phi_angle_degrees, theta_angle_degrees as i32));
             }
-            Input::MirrorRelative(x, y) => {
-                log.mirror_relative.push((x, y));
+            Input::MirrorRelative(phi_angle_degrees, theta_angle_degrees) => {
+                log.mirror_relative.push((phi_angle_degrees, theta_angle_degrees));
             }
             Input::TriggeringIrEyeCamera(trigger) => {
                 log.triggering_ir_eye_camera.push(trigger);
@@ -561,7 +562,9 @@ impl Interface for Main {
             | Input::IrEyeCameraFocusSweepValuesPolynomial(_)
             | Input::PerformIrEyeCameraFocusSweep
             | Input::IrEyeCameraMirrorSweepValuesPolynomial(_)
-            | Input::PerformIrEyeCameraMirrorSweep => {}
+            | Input::PerformIrEyeCameraMirrorSweep
+            | Input::WhiteLedBrightness(_)
+            | Input::ConeLedPattern(_) => {}
         }
     }
 
@@ -570,9 +573,10 @@ impl Interface for Main {
         input: &Input,
         ack_number: u32,
     ) -> Option<orb_messages::mcu_main::mcu_message::Message> {
+        use orb_messages::mcu_main::jetson_to_mcu::Payload as P;
         let payload = match input {
             Input::IrLed(ir_led) => {
-                orb_messages::mcu_main::jetson_to_mcu::Payload::InfraredLeds(orb_messages::mcu_main::InfraredLeDs {
+                P::InfraredLeds(orb_messages::mcu_main::InfraredLeDs {
                     wavelength: match ir_led {
                         IrLed::L850 => orb_messages::mcu_main::infrared_le_ds::Wavelength::Wavelength850nm as i32,
                         IrLed::L940 => orb_messages::mcu_main::infrared_le_ds::Wavelength::Wavelength940nm as i32,
@@ -589,23 +593,31 @@ impl Interface for Main {
                         IrLed::L940Right => {
                             orb_messages::mcu_main::infrared_le_ds::Wavelength::Wavelength940nmRight as i32
                         }
+                        IrLed::L850Center => {
+                            orb_messages::mcu_main::infrared_le_ds::Wavelength::Wavelength850nmCenter as i32
+                        }
+                        IrLed::L850Side => {
+                            orb_messages::mcu_main::infrared_le_ds::Wavelength::Wavelength850nmSide as i32
+                        }
+                        IrLed::L940Single => {
+                            orb_messages::mcu_main::infrared_le_ds::Wavelength::Wavelength940nmSingle as i32
+                        }
                         IrLed::None => orb_messages::mcu_main::infrared_le_ds::Wavelength::None as i32,
                         IrLed::L850Cont | IrLed::Burst => return None,
                     },
                 })
             }
             Input::IrLedDuration(on_duration) => {
-                orb_messages::mcu_main::jetson_to_mcu::Payload::LedOnTime(orb_messages::mcu_main::LedOnTimeUs {
+                P::LedOnTime(orb_messages::mcu_main::LedOnTimeUs {
                     on_duration_us: u32::from(*on_duration),
                 })
             }
-            Input::IrLedDuration740nm(on_duration) => {
-                orb_messages::mcu_main::jetson_to_mcu::Payload::LedOnTime740nm(orb_messages::mcu_main::LedOnTimeUs {
-                    on_duration_us: u32::from(*on_duration),
-                })
+            Input::IrLedDuration740nm(_on_duration) => {
+                // deprecated
+                return None;
             }
             Input::UserLedBrightness(brightness) => {
-                orb_messages::mcu_main::jetson_to_mcu::Payload::UserLedsBrightness(orb_messages::mcu_main::UserLeDsBrightness {
+                P::UserLedsBrightness(orb_messages::mcu_main::UserLeDsBrightness {
                     brightness: u32::from(*brightness),
                 })
             }
@@ -651,13 +663,24 @@ impl Interface for Main {
                         pulsing_period_ms = Some(period);
                         orb_messages::mcu_main::user_le_ds_pattern::UserRgbLedPattern::PulsingRgb as i32
                     }
+                    UserLedPattern::PulsingCustomRgbOnlyCenter(rgb, scale, period) => {
+                        custom_rgb = Some(rgb);
+                        pulsing_scale = Some(scale);
+                        pulsing_period_ms = Some(period);
+                        orb_messages::mcu_main::user_le_ds_pattern::UserRgbLedPattern::PulsingRgbOnlyCenter as i32
+                    }
+                    UserLedPattern::CustomRgbOnlyCenter(rgb) => {
+                        custom_rgb = Some(rgb);
+                        orb_messages::mcu_main::user_le_ds_pattern::UserRgbLedPattern::RgbOnlyCenter as i32
+                    }
                 };
-                orb_messages::mcu_main::jetson_to_mcu::Payload::UserLedsPattern(orb_messages::mcu_main::UserLeDsPattern {
+                P::UserLedsPattern(orb_messages::mcu_main::UserLeDsPattern {
                     pattern: pattern_value,
-                    custom_color: custom_rgb.map(|Rgb(r, g, b)| orb_messages::mcu_main::RgbColor {
+                    custom_color: custom_rgb.map(|Rgb(r, g, b, d)| orb_messages::mcu_main::RgbColor {
                         red: u32::from(r),
                         green: u32::from(g),
                         blue: u32::from(b),
+                        dimming: u32::from(d.unwrap_or(0)),
                     }),
                     start_angle: match pattern.start_angle {
                         Some(start) => u32::from(start),
@@ -673,60 +696,59 @@ impl Interface for Main {
                 })
             }
             Input::Shutdown(delay) => {
-                orb_messages::mcu_main::jetson_to_mcu::Payload::Shutdown(orb_messages::mcu_main::ShutdownWithDelay {
+                P::Shutdown(orb_messages::mcu_main::ShutdownWithDelay {
                     delay_s: u32::from(*delay),
                 })
             }
             Input::Temperature(_temperature) => {
-                // orb_messages::mcu_main::jetson_to_mcu::Payload::Temperature(orb_messages::Temperature {
+                // P::Temperature(orb_messages::mcu_main::Temperature {
                 //     source: orb_messages::mcu_main::temperature::TemperatureSource::Jetson as i32,
                 //     temperature_c: i32::from(*temperature),
                 // })
                 return None;
             }
             Input::Mirror(phi_angle_millidegrees, theta_angle_millidegrees) => {
-                orb_messages::mcu_main::jetson_to_mcu::Payload::MirrorAngle(orb_messages::mcu_main::MirrorAngle {
+                P::MirrorAngle(orb_messages::mcu_main::MirrorAngle {
                     horizontal_angle: 0,
                     vertical_angle: 0,
-                    phi_angle_millidegrees: *phi_angle_millidegrees,
-                    // We fixed this conversion in KK
-                    theta_angle_millidegrees: u32::try_from(*theta_angle_millidegrees).unwrap(),
-                    angle_type: orb_messages::mcu_main::MirrorAngleType::PhiTheta as i32,
-                })
-            }
-            Input::MirrorRelative(phi_angle_millidegrees, theta_angle_millidegrees) => orb_messages::mcu_main::jetson_to_mcu::Payload::MirrorAngleRelative(
-                orb_messages::mcu_main::MirrorAngleRelative {
-                    horizontal_angle: 0,
-                    vertical_angle: 0,
+                    angle_type: MirrorAngleType::PhiTheta as i32,
                     phi_angle_millidegrees: *phi_angle_millidegrees,
                     theta_angle_millidegrees: *theta_angle_millidegrees,
-                    angle_type: orb_messages::mcu_main::MirrorAngleType::PhiTheta as i32
-                },
-            ),
+                })
+            }
+            Input::MirrorRelative(phi_angle_millidegrees, theta_angle_millidegrees) => {
+                P::MirrorAngleRelative(orb_messages::mcu_main::MirrorAngleRelative {
+                    horizontal_angle: 0,
+                    vertical_angle: 0,
+                    angle_type: MirrorAngleType::PhiTheta as i32,
+                    phi_angle_millidegrees: *phi_angle_millidegrees,
+                    theta_angle_millidegrees: *theta_angle_millidegrees,
+                })
+            }
             Input::TriggeringIrEyeCamera(triggering) => {
                 if *triggering {
-                    orb_messages::mcu_main::jetson_to_mcu::Payload::StartTriggeringIrEyeCamera(
+                    P::StartTriggeringIrEyeCamera(
                         orb_messages::mcu_main::StartTriggeringIrEyeCamera {},
                     )
                 } else {
-                    orb_messages::mcu_main::jetson_to_mcu::Payload::StopTriggeringIrEyeCamera(
+                    P::StopTriggeringIrEyeCamera(
                         orb_messages::mcu_main::StopTriggeringIrEyeCamera {},
                     )
                 }
             }
             Input::TriggeringIrFaceCamera(triggering) => {
                 if *triggering {
-                    orb_messages::mcu_main::jetson_to_mcu::Payload::StartTriggeringIrFaceCamera(
+                    P::StartTriggeringIrFaceCamera(
                         orb_messages::mcu_main::StartTriggeringIrFaceCamera {},
                     )
                 } else {
-                    orb_messages::mcu_main::jetson_to_mcu::Payload::StopTriggeringIrFaceCamera(
+                    P::StopTriggeringIrFaceCamera(
                         orb_messages::mcu_main::StopTriggeringIrFaceCamera {},
                     )
                 }
             }
             Input::PerformMirrorHoming(mode, angle) => {
-                orb_messages::mcu_main::jetson_to_mcu::Payload::DoHoming(orb_messages::mcu_main::PerformMirrorHoming {
+                P::DoHoming(orb_messages::mcu_main::PerformMirrorHoming {
                     homing_mode: match mode {
                         MirrorHomingMode::StallDetection => {
                             orb_messages::mcu_main::perform_mirror_homing::Mode::StallDetection as i32
@@ -739,17 +761,17 @@ impl Interface for Main {
                         MirrorHomingAngle::Both => {
                             orb_messages::mcu_main::perform_mirror_homing::Angle::Both as i32
                         }
-                        MirrorHomingAngle::Vertical => {
+                        MirrorHomingAngle::VerticalTheta => {
                             orb_messages::mcu_main::perform_mirror_homing::Angle::VerticalTheta as i32
                         }
-                        MirrorHomingAngle::Horizontal => {
+                        MirrorHomingAngle::HorizontalPhi => {
                             orb_messages::mcu_main::perform_mirror_homing::Angle::HorizontalPhi as i32
                         }
                     },
                 })
             }
             Input::LiquidLens(current) => {
-                orb_messages::mcu_main::jetson_to_mcu::Payload::LiquidLens(orb_messages::mcu_main::LiquidLens {
+                P::LiquidLens(orb_messages::mcu_main::LiquidLens {
                     current: i32::from(current.unwrap_or(0)),
                     enable: current.is_some(),
                 })
@@ -761,52 +783,57 @@ impl Interface for Main {
                     clippy::cast_sign_loss,
                     clippy::cast_precision_loss
                 )]
-                orb_messages::mcu_main::jetson_to_mcu::Payload::FanSpeed(orb_messages::mcu_main::FanSpeed {
+                P::FanSpeed(orb_messages::mcu_main::FanSpeed {
                     payload: Some(orb_messages::mcu_main::fan_speed::Payload::Value(
                         (*percentage / 100.0 * f32::from(u16::MAX)) as u32,
                     )),
                 })
             }
             Input::RingLeds(sequence) => {
-                orb_messages::mcu_main::jetson_to_mcu::Payload::RingLedsSequence(orb_messages::mcu_main::UserRingLeDsSequence {
+                P::RingLedsSequence(orb_messages::mcu_main::UserRingLeDsSequence {
                     data_format: Some(
                         orb_messages::mcu_main::user_ring_le_ds_sequence::DataFormat::RgbUncompressed(
-                            sequence.iter().flat_map(|&Rgb(r, g, b)| [r, g, b]).collect(),
+                            sequence.iter().flat_map(|&Rgb(r, g, b, _)| [r, g, b]).collect(),
                         ),
                     ),
                 })
             }
-            Input::CenterLeds(sequence) => orb_messages::mcu_main::jetson_to_mcu::Payload::CenterLedsSequence(
+            Input::CenterLeds(sequence) => P::CenterLedsSequence(
                 orb_messages::mcu_main::UserCenterLeDsSequence {
                     data_format: Some(
                         orb_messages::mcu_main::user_center_le_ds_sequence::DataFormat::RgbUncompressed(
-                            sequence.iter().flat_map(|&Rgb(r, g, b)| [r, g, b]).collect(),
+                            sequence.iter().flat_map(|&Rgb(r, g, b, _)| [r, g, b]).collect(),
                         ),
                     ),
                 },
             ),
             Input::OperatorLeds(sequence) => {
-                orb_messages::mcu_main::jetson_to_mcu::Payload::DistributorLedsSequence(
+                P::DistributorLedsSequence(
                     orb_messages::mcu_main::DistributorLeDsSequence {
                         data_format: Some(
                             orb_messages::mcu_main::distributor_le_ds_sequence::DataFormat::RgbUncompressed(
-                                sequence.iter().flat_map(|&Rgb(r, g, b)| [r, g, b]).collect(),
+                                sequence.iter().flat_map(|&Rgb(r, g, b, _)| [r, g, b]).collect(),
                             ),
                         ),
                     },
                 )
             }
             Input::FrameRate(fps) => {
-                orb_messages::mcu_main::jetson_to_mcu::Payload::Fps(orb_messages::mcu_main::Fps { fps: u32::from(*fps) })
+                P::Fps(orb_messages::mcu_main::Fps { fps: u32::from(*fps) })
             }
             Input::ValueGet(Property::FirmwareVersions) | Input::Version => {
-                orb_messages::mcu_main::jetson_to_mcu::Payload::ValueGet(orb_messages::mcu_main::ValueGet {
+                P::ValueGet(orb_messages::mcu_main::ValueGet {
                     value: orb_messages::mcu_main::value_get::Value::FirmwareVersions as i32,
                 })
             }
             Input::OperatorLedBrightness(brightness) => {
-                orb_messages::mcu_main::jetson_to_mcu::Payload::DistributorLedsBrightness(
+                P::DistributorLedsBrightness(
                     orb_messages::mcu_main::DistributorLeDsBrightness { brightness: u32::from(*brightness) },
+                )
+            }
+            Input::WhiteLedBrightness(brightness) => {
+                P::WhiteLedsBrightness(
+                    orb_messages::mcu_main::WhiteLeDsBrightness { brightness: *brightness },
                 )
             }
             Input::OperatorLedPattern(pattern) => {
@@ -835,15 +862,39 @@ impl Interface for Main {
                         orb_messages::mcu_main::distributor_le_ds_pattern::DistributorRgbLedPattern::Rgb as i32
                     }
                 };
-                orb_messages::mcu_main::jetson_to_mcu::Payload::DistributorLedsPattern(
+                P::DistributorLedsPattern(
                     orb_messages::mcu_main::DistributorLeDsPattern {
                         pattern: pattern_value,
                         custom_color: custom_rgb.map(|rgb| orb_messages::mcu_main::RgbColor {
                             red: u32::from(rgb.red),
                             green: u32::from(rgb.green),
                             blue: u32::from(rgb.blue),
+                            dimming: u32::from(rgb.dimming.unwrap_or(0)),
                         }),
                         leds_mask: pattern.mask,
+                    },
+                )
+            }
+            Input::ConeLedPattern(pattern) => {
+                let mut custom_rgb: Option<Rgb> = None;
+                let pattern_value = match pattern.pattern {
+                    ConeLedPattern::Off => {
+                        orb_messages::mcu_main::cone_le_ds_pattern::ConeRgbLedPattern::Off as i32
+                    }
+                    ConeLedPattern::CustomRgb(rgb) => {
+                        custom_rgb = Some(rgb);
+                        orb_messages::mcu_main::cone_le_ds_pattern::ConeRgbLedPattern::Rgb as i32
+                    }
+                };
+                P::ConeLedsPattern(
+                    orb_messages::mcu_main::ConeLeDsPattern {
+                        pattern: pattern_value,
+                        custom_color: custom_rgb.map(|rgb| orb_messages::mcu_main::RgbColor {
+                            red: u32::from(rgb.0),
+                            green: u32::from(rgb.1),
+                            blue: u32::from(rgb.2),
+                            dimming: u32::from(rgb.3.unwrap_or(0)),
+                        }),
                     },
                 )
             }
@@ -852,12 +903,12 @@ impl Interface for Main {
                 return None;
             },
             Input::VoltageRequest =>
-                orb_messages::mcu_main::jetson_to_mcu::Payload::VoltageRequest(orb_messages::mcu_main::VoltageRequest {
+                P::VoltageRequest(orb_messages::mcu_main::VoltageRequest {
                     transmit_period_ms: 0_u32,
                 }),
             Input::VoltageRequestPeriod(period) => {
                 tracing::info!("Setting voltage request period to {} ms", period);
-                orb_messages::mcu_main::jetson_to_mcu::Payload::VoltageRequest(orb_messages::mcu_main::VoltageRequest {
+                P::VoltageRequest(orb_messages::mcu_main::VoltageRequest {
                     transmit_period_ms: *period,
                 })
             }
@@ -869,7 +920,7 @@ impl Interface for Main {
                                                              coef_e,
                                                              coef_f,
                                                              number_of_frames,
-                                                         }) => orb_messages::mcu_main::jetson_to_mcu::Payload::IrEyeCameraFocusSweepValuesPolynomial(
+                                                         }) => P::IrEyeCameraFocusSweepValuesPolynomial(
                 orb_messages::mcu_main::IrEyeCameraFocusSweepValuesPolynomial {
                     coef_a: *coef_a,
                     coef_b: *coef_b,
@@ -881,7 +932,7 @@ impl Interface for Main {
                 },
             ),
             Input::PerformIrEyeCameraFocusSweep => {
-                orb_messages::mcu_main::jetson_to_mcu::Payload::PerformIrEyeCameraFocusSweep(
+                P::PerformIrEyeCameraFocusSweep(
                     orb_messages::mcu_main::PerformIrEyeCameraFocusSweep {},
                 )
             }
@@ -893,7 +944,7 @@ impl Interface for Main {
                 angle_coef_b,
                 angle_coef_c,
                 number_of_frames,
-            }) => orb_messages::mcu_main::jetson_to_mcu::Payload::IrEyeCameraMirrorSweepValuesPolynomial(
+            }) => P::IrEyeCameraMirrorSweepValuesPolynomial(
                 orb_messages::mcu_main::IrEyeCameraMirrorSweepValuesPolynomial {
                     radius_coef_a: *radius_coef_a,
                     radius_coef_b: *radius_coef_b,
@@ -905,7 +956,7 @@ impl Interface for Main {
                 },
             ),
             Input::PerformIrEyeCameraMirrorSweep => {
-                orb_messages::mcu_main::jetson_to_mcu::Payload::PerformIrEyeCameraMirrorSweep(
+                P::PerformIrEyeCameraMirrorSweep(
                     orb_messages::mcu_main::PerformIrEyeCameraMirrorSweep {},
                 )
             }
@@ -920,22 +971,21 @@ impl Interface for Main {
         nmea_parser: &mut NmeaParser,
         nmea_prev_part: &mut Option<(u32, String)>,
     ) -> Option<Output> {
+        use orb_messages::mcu_main::mcu_to_jetson::Payload as P;
         match message {
-            orb_messages::mcu_main::mcu_to_jetson::Payload::PowerButton(
-                orb_messages::mcu_main::PowerButton { pressed },
-            ) => Some(Output::Button(pressed)),
-            orb_messages::mcu_main::mcu_to_jetson::Payload::Gnss(
-                orb_messages::mcu_main::GnssData { nmea },
-            ) => match nmea_parser.parse_sentence(&nmea) {
-                Ok(message) => Some(Output::Gps(message)),
-                Err(err) => {
-                    tracing::error!("Error parsing NMEA: {err:?}");
-                    None
+            P::PowerButton(orb_messages::mcu_main::PowerButton { pressed }) => {
+                Some(Output::Button(pressed))
+            }
+            P::Gnss(orb_messages::mcu_main::GnssData { nmea }) => {
+                match nmea_parser.parse_sentence(&nmea) {
+                    Ok(message) => Some(Output::Gps(message)),
+                    Err(err) => {
+                        tracing::error!("Error parsing NMEA: {err:?}");
+                        None
+                    }
                 }
-            },
-            orb_messages::mcu_main::mcu_to_jetson::Payload::GnssPartial(
-                orb_messages::mcu_main::GnssDataPartial { counter, nmea_part },
-            ) => {
+            }
+            P::GnssPartial(orb_messages::mcu_main::GnssDataPartial { counter, nmea_part }) => {
                 if counter % 2 == 0 {
                     *nmea_prev_part = Some((counter, nmea_part));
                 } else if let Some((counter_prev, nmea_prev_part)) = nmea_prev_part.take() {
@@ -949,71 +999,33 @@ impl Interface for Main {
                 }
                 None
             }
-            orb_messages::mcu_main::mcu_to_jetson::Payload::Temperature(temperature) => {
-                Some(Output::Temperature(temperature))
-            }
-            orb_messages::mcu_main::mcu_to_jetson::Payload::Log(orb_messages::mcu_main::Log {
-                log,
-            }) => Some(Output::Logs(log)),
-            orb_messages::mcu_main::mcu_to_jetson::Payload::Voltage(voltage) => {
-                Some(Output::Voltage(voltage))
-            }
-            orb_messages::mcu_main::mcu_to_jetson::Payload::MotorRange(motor_range) => {
-                Some(Output::MotorRange(motor_range))
-            }
-            orb_messages::mcu_main::mcu_to_jetson::Payload::Versions(versions) => {
-                Some(Output::Versions(Versions::from(&versions)))
-            }
-            orb_messages::mcu_main::mcu_to_jetson::Payload::BatteryCapacity(capacity) => {
-                Some(Output::BatteryCapacity(capacity))
-            }
-            orb_messages::mcu_main::mcu_to_jetson::Payload::BatteryVoltage(battery_voltage) => {
-                Some(Output::BatteryVoltage(battery_voltage))
-            }
-            orb_messages::mcu_main::mcu_to_jetson::Payload::BatteryIsCharging(is_charging) => {
-                Some(Output::BatteryIsCharging(is_charging))
-            }
-            orb_messages::mcu_main::mcu_to_jetson::Payload::BatteryInfoHwFw(battery_info) => {
-                Some(Output::BatteryInfo(battery_info))
-            }
-            orb_messages::mcu_main::mcu_to_jetson::Payload::BatteryResetReason(reason) => {
-                Some(Output::BatteryReset(reason))
-            }
-            orb_messages::mcu_main::mcu_to_jetson::Payload::BatteryDiagCommon(diag) => {
-                Some(Output::BatteryDiagCommon(diag))
-            }
-            orb_messages::mcu_main::mcu_to_jetson::Payload::BatteryDiagSafety(diag) => {
-                Some(Output::BatteryDiagSafety(diag))
-            }
-            orb_messages::mcu_main::mcu_to_jetson::Payload::BatteryDiagPermanentFail(diag) => {
-                Some(Output::BatteryDiagPermanentFail(diag))
-            }
-            orb_messages::mcu_main::mcu_to_jetson::Payload::BatteryInfoMaxValues(diag) => {
-                Some(Output::BatteryInfoMaxValues(diag))
-            }
-            orb_messages::mcu_main::mcu_to_jetson::Payload::BatteryInfoSocAndStatistics(diag) => {
-                Some(Output::BatteryInfoSocAndStatistics(diag))
-            }
-            orb_messages::mcu_main::mcu_to_jetson::Payload::Tof1d(distance) => {
-                Some(Output::TofDistance(distance.distance_mm))
-            }
-            orb_messages::mcu_main::mcu_to_jetson::Payload::FanStatus(status) => {
-                Some(Output::FanStatus(status))
-            }
-            orb_messages::mcu_main::mcu_to_jetson::Payload::FrontAls(als) => {
-                Some(Output::AmbientLight(als))
-            }
-            orb_messages::mcu_main::mcu_to_jetson::Payload::FatalError(error) => {
-                Some(Output::FatalError(error))
-            }
-            orb_messages::mcu_main::mcu_to_jetson::Payload::HardwareDiag(diag) => {
-                Some(Output::HardwareDiag(diag))
-            }
-            orb_messages::mcu_main::mcu_to_jetson::Payload::Ack(_)
-            | orb_messages::mcu_main::mcu_to_jetson::Payload::ImuData(_)
-            | orb_messages::mcu_main::mcu_to_jetson::Payload::MemfaultEvent(_)
-            | orb_messages::mcu_main::mcu_to_jetson::Payload::ConePresent(_)
-            | orb_messages::mcu_main::mcu_to_jetson::Payload::Hardware(_) => None,
+            P::Temperature(temperature) => Some(Output::Temperature(temperature)),
+            P::Log(orb_messages::mcu_main::Log { log }) => Some(Output::Logs(log)),
+            P::Voltage(voltage) => Some(Output::Voltage(voltage)),
+            P::MotorRange(motor_range) => Some(Output::MotorRange(motor_range)),
+            P::Versions(versions) => Some(Output::Versions(Versions::from(&versions))),
+            P::BatteryCapacity(capacity) => Some(Output::BatteryCapacity(capacity)),
+            P::BatteryVoltage(battery_voltage) => Some(Output::BatteryVoltage(battery_voltage)),
+            P::BatteryIsCharging(is_charging) => Some(Output::BatteryIsCharging(is_charging)),
+            P::BatteryInfoHwFw(battery_info) => Some(Output::BatteryInfo(battery_info)),
+            P::BatteryResetReason(reason) => Some(Output::BatteryReset(reason)),
+            P::BatteryDiagCommon(diag) => Some(Output::BatteryDiagCommon(diag)),
+            P::BatteryDiagSafety(diag) => Some(Output::BatteryDiagSafety(diag)),
+            P::BatteryDiagPermanentFail(diag) => Some(Output::BatteryDiagPermanentFail(diag)),
+            P::BatteryInfoMaxValues(diag) => Some(Output::BatteryInfoMaxValues(diag)),
+            P::BatteryInfoSocAndStatistics(diag) => Some(Output::BatteryInfoSocAndStatistics(diag)),
+            P::BatteryStateOfHealth(diag) => Some(Output::BatteryStateOfHealth(diag)),
+            P::Tof1d(distance) => Some(Output::TofDistance(distance.distance_mm)),
+            P::FanStatus(status) => Some(Output::FanStatus(status)),
+            P::FrontAls(als) => Some(Output::AmbientLight(als)),
+            P::FatalError(error) => Some(Output::FatalError(error)),
+            P::HardwareDiag(diag) => Some(Output::HardwareDiag(diag)),
+            P::Ack(_)
+            | P::ImuData(_)
+            | P::Hardware(_)
+            | P::ConePresent(_)
+            | P::MemfaultEvent(_)
+            | P::Shutdown(_) => None,
         }
     }
 
@@ -1027,11 +1039,9 @@ impl Jetson {
     pub fn spawn() -> Result<Self> {
         let (input_tx, input_rx) = mpsc::channel(INPUT_CAPACITY);
         let (output_tx, output_rx) = broadcast::channel(OUTPUT_CAPACITY);
-        let (serial_input_tx, serial_input_rx) = mpsc::channel(INPUT_CAPACITY);
         let output_rx = BroadcastStream::new(output_rx).fuse();
         Can::<Main>::spawn(input_rx, output_tx.clone())?;
-        Serial::<Main>::spawn(serial_input_rx)?;
-        Ok(Self { log: None, input_tx, serial_input_tx, output_tx, output_rx })
+        Ok(Self { log: None, input_tx, output_tx, output_rx })
     }
 }
 
@@ -1040,7 +1050,6 @@ impl Mcu<Main> for Jetson {
         Box::new(Self {
             log: None,
             input_tx: self.input_tx.clone(),
-            serial_input_tx: self.serial_input_tx.clone(),
             output_tx: self.output_tx.clone(),
             output_rx: BroadcastStream::new(self.output_tx.subscribe()).fuse(),
         })
@@ -1064,10 +1073,6 @@ impl Mcu<Main> for Jetson {
 
     fn log_mut(&mut self) -> &mut Option<Log> {
         &mut self.log
-    }
-
-    fn send_uart(&mut self, input: Input) -> Result<()> {
-        self.serial_input_tx.send_now(input)
     }
 }
 

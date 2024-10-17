@@ -6,14 +6,16 @@ use crate::{
     agents::{
         camera::{self, Frame},
         python::{check_model_version, AgentPython},
-        Agent,
+        ProcessInitializer,
     },
     consts::{RGB_NATIVE_HEIGHT, RGB_NATIVE_WIDTH},
-    get_and_extract, get_item, inst_elapsed,
-    logger::{LogOnError, DATADOG, NO_TAGS},
-    port::{Port, SharedPort},
+    dd_timing, get_and_extract, get_item,
 };
-use eyre::{Result, WrapErr};
+use agentwire::{
+    agent::{self, Agent as _},
+    port::{self, Port, SharedPort},
+};
+use eyre::{Error, Result, WrapErr};
 use ndarray::prelude::*;
 use numpy::PyArray3;
 use orb_rgb_net::RgbNet;
@@ -21,7 +23,7 @@ use pyo3::prelude::*;
 use rkyv::{Archive, Deserialize, Serialize};
 use schemars::JsonSchema;
 use serde::Serialize as SerdeSerialize;
-use std::time::Instant;
+use std::{mem::size_of, time::Instant};
 
 /// RGB-Net python agent.
 ///
@@ -156,13 +158,14 @@ impl Port for Model {
 }
 
 impl SharedPort for Model {
-    const SERIALIZED_CONFIG_EXTRA_SIZE: usize = 0;
+    const SERIALIZED_INIT_SIZE: usize =
+        size_of::<usize>() + size_of::<<Model as Archive>::Archived>();
     const SERIALIZED_INPUT_SIZE: usize =
         4096 + RGB_NATIVE_HEIGHT as usize * RGB_NATIVE_WIDTH as usize * 3;
     const SERIALIZED_OUTPUT_SIZE: usize = 4096;
 }
 
-impl super::Agent for Model {
+impl agentwire::Agent for Model {
     const NAME: &'static str = "rgb-net";
 }
 
@@ -177,18 +180,12 @@ impl super::Environment<Model> for Environment<'_> {
             ArchivedInput::Warmup => ("warmup", self.warmup(py).map(|()| Output::Warmup)),
         };
 
-        DATADOG
-            .timing(
-                format!("orb.main.time.processing.{}.{}", Model::DD_NS, op),
-                inst_elapsed!(t),
-                NO_TAGS,
-            )
-            .or_log();
+        dd_timing!("main.time.processing" + format!("{}.{}", Model::DD_NS, op), t);
         tracing::trace!(
             "Python agent {}::{} <benchmark>: {} ms",
             Model::NAME,
             op,
-            inst_elapsed!(t)
+            t.elapsed().as_millis()
         );
 
         res.or_else(|e| {
@@ -213,15 +210,9 @@ impl Environment<'_> {
         tracing::info!(
             "Python agent {} <benchmark>: initialization done in {} ms",
             Model::NAME,
-            inst_elapsed!(t)
+            t.elapsed().as_millis()
         );
-        DATADOG
-            .timing(
-                format!("orb.main.time.neural_network.init.{}", Model::DD_NS),
-                inst_elapsed!(t),
-                NO_TAGS,
-            )
-            .or_log();
+        dd_timing!("main.time.neural_network.init" + format!("{}", Model::DD_NS), t);
 
         Ok(Environment { rgb_net })
     }
@@ -252,6 +243,18 @@ impl super::AgentPython for Model {
     }
 }
 
+impl agentwire::agent::Process for Model {
+    type Error = Error;
+
+    fn run(self, port: port::RemoteInner<Self>) -> Result<(), Self::Error> {
+        self.run_python_process(port)
+    }
+
+    fn initializer() -> impl agent::process::Initializer {
+        ProcessInitializer::default()
+    }
+}
+
 impl EstimateOutput {
     /// Returns the primary prediction.
     #[must_use]
@@ -264,6 +267,7 @@ impl EstimatePredictionOutput {
     /// Estimates user distance.
     #[must_use]
     pub fn user_distance(&self) -> f64 {
+        // TODO(valff) this value got old and is no longer precise, should be re-measured
         const ALPHA_RGB_CAMERA: f64 = 40.0;
         let delta_x = (self.landmarks.left_eye.x - self.landmarks.right_eye.x).abs();
         let delta_y = (self.landmarks.left_eye.y - self.landmarks.right_eye.y).abs();
@@ -336,7 +340,7 @@ fn extract_point(coordinates: &PyAny) -> Result<Point> {
 pub fn estimate_once(py: Python, frame: &camera::rgb::Frame) -> Result<EstimateOutput> {
     let rgb_net = RgbNet::init(py)?;
     let shape = (frame.height() as usize, frame.width() as usize, 3);
-    let image = Array::from_shape_vec(shape, frame.to_vec())?;
+    let image = Array::from_shape_vec(shape, frame.as_bytes().to_vec())?;
     let image = PyArray3::from_owned_array(py, image);
     let estimate = rgb_net.estimate(image)?;
     extract(estimate)

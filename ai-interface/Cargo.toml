@@ -1,0 +1,16 @@
+[package]
+name = "ai-interface"
+version = "0.1.0"
+authors = ["Anastasios Andronidis <anastasios.andronidis@toolsforhumanity.com>"]
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+eyre.workspace = true
+pyo3.workspace = true
+rkyv.workspace = true
+schemars.workspace = true
+serde_json.workspace = true
+serde.workspace = true
+thiserror.workspace = true

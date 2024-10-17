@@ -8,11 +8,11 @@
         "rust-analyzer-src": "rust-analyzer-src"
       },
       "locked": {
-        "lastModified": 1705040632,
-        "narHash": "sha256-x8mdmY4CKeHDB/eRAHC3YR1WA77IPCxWyijyEFrmwfQ=",
+        "lastModified": 1713853552,
+        "narHash": "sha256-OOXi+9cSbst7Crah6UVxHe33O6HK91WgD2yU/p5/dqs=",
         "owner": "nix-community",
         "repo": "fenix",
-        "rev": "394b7565db9d174cf65326f094e0f558333dca82",
+        "rev": "d596927635ddd8db224bbff6e4ccb08e42649eb5",
         "type": "github"
       },
       "original": {
@@ -21,19 +21,52 @@
         "type": "github"
       }
     },
+    "iris": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1701856455,
+        "narHash": "sha256-yPxu3wttaklGhrNbZqtqAi/+AvScV8hoYWqbt4aa+KA=",
+        "owner": "worldcoin",
+        "repo": "iris",
+        "rev": "726540ee7e90bd4517ddb83cf2bfc1d30a9b653e",
+        "type": "github"
+      },
+      "original": {
+        "owner": "worldcoin",
+        "ref": "v1.6.1",
+        "repo": "iris",
+        "type": "github"
+      }
+    },
     "nixpkgs": {
       "locked": {
-        "lastModified": 1704290814,
-        "narHash": "sha256-LWvKHp7kGxk/GEtlrGYV68qIvPHkU9iToomNFGagixU=",
+        "lastModified": 1713725259,
+        "narHash": "sha256-9ZR/Rbx5/Z/JZf5ehVNMoz/s5xjpP0a22tL6qNvLt5E=",
         "owner": "NixOS",
         "repo": "nixpkgs",
-        "rev": "70bdadeb94ffc8806c0570eb5c2695ad29f0e421",
+        "rev": "a5e4bbcb4780c63c79c87d29ea409abf097de3f7",
         "type": "github"
       },
       "original": {
         "id": "nixpkgs",
-        "ref": "nixos-23.05",
+        "ref": "nixos-23.11",
         "type": "indirect"
+      }
+    },
+    "nixpkgs-24_05": {
+      "locked": {
+        "lastModified": 1728740863,
+        "narHash": "sha256-u+rxA79a0lyhG+u+oPBRtTDtzz8kvkc9a6SWSt9ekVc=",
+        "owner": "NixOS",
+        "repo": "nixpkgs",
+        "rev": "a3f9ad65a0bf298ed5847629a57808b97e6e8077",
+        "type": "github"
+      },
+      "original": {
+        "owner": "NixOS",
+        "ref": "nixos-24.05",
+        "repo": "nixpkgs",
+        "type": "github"
       }
     },
     "nixpkgs-old": {
@@ -52,23 +85,60 @@
         "type": "indirect"
       }
     },
+    "rgb-net": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1696600311,
+        "narHash": "sha256-hd6m1GzloG9q5A8SDPGrPD4eHpuir/47DJUp7Y9zre4=",
+        "owner": "worldcoin",
+        "repo": "rgb-net",
+        "rev": "e0a6fe02ff942377659b0a61766b55c9dd687c08",
+        "type": "github"
+      },
+      "original": {
+        "owner": "worldcoin",
+        "ref": "v2.0.2",
+        "repo": "rgb-net",
+        "type": "github"
+      }
+    },
     "root": {
       "inputs": {
         "fenix": "fenix",
+        "iris": "iris",
         "nixpkgs": "nixpkgs",
+        "nixpkgs-24_05": "nixpkgs-24_05",
         "nixpkgs-old": "nixpkgs-old",
+        "rgb-net": "rgb-net",
+        "royaleSdk": "royaleSdk",
         "seekSdk": "seekSdk",
         "utils": "utils"
+      }
+    },
+    "royaleSdk": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1714472198,
+        "narHash": "sha256-EfxCAo7qZrI+xuNl/qZ3hjpF3tZw4hsyKB+9YcvT+t8=",
+        "owner": "worldcoin",
+        "repo": "royale-sdk-worldcoin",
+        "rev": "d69770be0bb3280f94b2b8ebf259bd3eaf4e1149",
+        "type": "github"
+      },
+      "original": {
+        "owner": "worldcoin",
+        "repo": "royale-sdk-worldcoin",
+        "type": "github"
       }
     },
     "rust-analyzer-src": {
       "flake": false,
       "locked": {
-        "lastModified": 1704974004,
-        "narHash": "sha256-H3RdtMxH8moTInVmracgtF8bgFpaEE3zYoSkuv7PBs0=",
+        "lastModified": 1713801366,
+        "narHash": "sha256-VmzP5s59kb6//mj+ES+hslTLuugjd7OluGIXXcwuyHg=",
         "owner": "rust-lang",
         "repo": "rust-analyzer",
-        "rev": "9d8889cdfcc3aa0302353fc988ed21ff9bc9925c",
+        "rev": "e31c9f3fe11148514c3ad254b639b2ed7dbe35de",
         "type": "github"
       },
       "original": {
@@ -114,11 +184,11 @@
         "systems": "systems"
       },
       "locked": {
-        "lastModified": 1701680307,
-        "narHash": "sha256-kAuep2h5ajznlPMD9rnQyffWG8EM/C73lejGofXvdM8=",
+        "lastModified": 1710146030,
+        "narHash": "sha256-SZ5L6eA7HJ/nmkzGG7/ISclqe6oZdOZTNoesiInkXPQ=",
         "owner": "numtide",
         "repo": "flake-utils",
-        "rev": "4022d587cbbfd70fe950c1e2083a02621806a725",
+        "rev": "b1d9ab70662946ef0850d488da1c9019f3a9752a",
         "type": "github"
       },
       "original": {

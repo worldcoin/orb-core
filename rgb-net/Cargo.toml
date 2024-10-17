@@ -2,8 +2,12 @@
 name = "orb-rgb-net"
 version = "0.1.0"
 authors = ["Dan Girshovich"]
-edition = "2021"
+edition.workspace = true
 license.workspace = true
+publish = false
+
+[features]
+cuda-test = []
 
 [dependencies]
 eyre.workspace = true

@@ -2,13 +2,14 @@ use crate::{
     agents::python::{extract_rkyv_ndarray_d1, rgb_net},
     utils::RkyvNdarray,
 };
+use ai_interface::PyError;
 use ndarray::{Ix1, Ix3};
 use numpy::PyArray3;
 use pyo3::prelude::*;
-use python_agent_interface::PyError;
 use rkyv::{Archive, Deserialize, Serialize};
 use schemars::JsonSchema;
 use serde::{Deserialize as SerdeDeserialize, Serialize as SerdeSerialize};
+use std::collections::HashMap;
 
 #[derive(FromPyObject, Debug, Clone, Default, Archive, Serialize, Deserialize, SerdeSerialize)]
 #[pyo3(from_item_all)]
@@ -81,6 +82,15 @@ pub struct Point {
 )]
 #[pyo3(from_item_all)]
 #[allow(missing_docs)]
+pub struct FraudChecks {
+    pub error: Option<PyError>,
+}
+
+#[derive(
+    FromPyObject, Debug, Default, Clone, Archive, Serialize, Deserialize, SerdeSerialize, JsonSchema,
+)]
+#[pyo3(from_item_all)]
+#[allow(missing_docs)]
 pub struct Triplet<T> {
     pub left: T,
     pub right: T,
@@ -88,26 +98,16 @@ pub struct Triplet<T> {
 }
 
 #[derive(
-    FromPyObject, Debug, Clone, Default, Archive, Serialize, Deserialize, SerdeSerialize, JsonSchema,
+    FromPyObject, Debug, Default, Clone, Archive, Serialize, Deserialize, SerdeSerialize, JsonSchema,
 )]
 #[pyo3(from_item_all)]
 #[allow(missing_docs)]
-pub struct DifferentFaceAttack {
-    pub biometric: DifferentFaceAttackItem,
-    pub self_custody: DifferentFaceAttackItem,
-}
-
-#[derive(
-    FromPyObject, Debug, Clone, Default, Archive, Serialize, Deserialize, SerdeSerialize, JsonSchema,
-)]
-#[pyo3(from_item_all)]
-#[allow(missing_docs)]
-pub struct DifferentFaceAttackItem {
+pub struct FIIsValidOutput {
     pub error: Option<PyError>,
     pub inference_backend: Option<String>,
 
-    pub attack_detected: Option<bool>,
-    pub similarity: Option<f64>,
+    pub is_valid: Option<bool>,
+    pub score: Option<f64>,
 }
 
 #[derive(Debug, Default, Clone, Archive, Serialize, Deserialize, SerdeSerialize, JsonSchema)]
@@ -131,9 +131,25 @@ pub struct ValidationsOutput {
     pub quality: bool,
     pub face_detected: bool,
 }
+
+#[derive(
+    FromPyObject, Debug, Clone, Default, Archive, Serialize, Deserialize, SerdeSerialize, JsonSchema,
+)]
+#[pyo3(from_item_all)]
+#[allow(missing_docs)]
+pub struct BoundingBox {
+    pub height: f64,
+    pub origin: Point,
+    pub rotation: f64,
+    pub width: f64,
+}
+
 /// Convenience wrapper struct for the Face Identifier model's configuration coming from the backend.
 #[derive(
     Archive, Serialize, Deserialize, SerdeDeserialize, SerdeSerialize, Debug, Clone, JsonSchema,
 )]
 #[serde(rename_all = "PascalCase")]
-pub struct BackendConfig {}
+pub struct BackendConfig {
+    /// Face Identifier: Namespaced model configs in base64.
+    pub face_identifier_model_configs: Option<HashMap<String, String>>,
+}

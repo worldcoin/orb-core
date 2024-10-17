@@ -1,26 +1,40 @@
 //! Biometric capture.
 
+pub mod focus_sweep;
+pub mod mirror_sweep;
+pub mod multi_wavelength;
+pub mod overcapture;
+pub mod pupil_contraction;
+
+use super::qr_scan;
 use crate::{
     agents::{
-        camera, mirror,
-        python::{face_identifier, ir_net, ir_net::EstimateOutput, rgb_net},
+        camera, distance, mirror,
+        python::{
+            face_identifier,
+            ir_net::{self, EstimateOutput},
+            rgb_net,
+        },
     },
-    brokers::{BrokerFlow, Orb, OrbPlan},
+    brokers::{Orb, OrbPlan},
     config::Config,
     consts::{
-        CONTINUOUS_CALIBRATION_REDUCER, IRIS_BRIGHTNESS_RANGE, IRIS_SCORE_MIN, IRIS_SHARPNESS_MIN,
+        CALIBRATION_FILE_PATH, CONTINUOUS_CALIBRATION_REDUCER, DEFAULT_DELAY_BETWEEN_EYE_CAPTURES,
+        IRIS_BRIGHTNESS_RANGE, IRIS_SCORE_MIN, IRIS_SHARPNESS_MIN, IR_FOCUS_RANGE, RGB_FPS,
         RGB_REDUCED_HEIGHT, RGB_REDUCED_WIDTH, THRESHOLD_OCCLUSION_30,
     },
+    dd_gauge, dd_incr,
     ext::broadcast::ReceiverExt as _,
-    logger::{LogOnError, DATADOG, NO_TAGS},
     mcu::{self, main::IrLed},
     pid::{derivative::LowPassFilter, InstantTimer, Timer},
-    port,
 };
+use agentwire::{port, BrokerFlow};
 use eyre::Result;
 use futures::{future::Fuse, prelude::*};
 use ordered_float::OrderedFloat;
 use rand::random;
+use schemars::JsonSchema;
+use serde::Serialize;
 use std::{
     collections::VecDeque,
     mem::take,
@@ -79,6 +93,10 @@ pub struct Capture {
     pub eye_right: EyeCapture,
     /// Candidate data for self-custody face.
     pub face_self_custody_candidate: SelfCustodyCandidate,
+    /// Face IR camera frame.
+    pub face_ir: Option<camera::ir::Frame>,
+    /// Thermal camera frame.
+    pub thermal: Option<camera::thermal::Frame>,
     /// Average GPS latitude during capture.
     pub latitude: Option<f64>,
     /// Average GPS longitude during capture.
@@ -96,6 +114,32 @@ pub struct Log {
     pub main_mcu: mcu::main::Log,
     /// Movable mirrors configuration history.
     pub mirror: mirror::Log,
+    /// User distance history.
+    pub user_distance: distance::Log,
+}
+
+/// Report of an extension configuration and metadata.
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+pub enum ExtensionReport {
+    /// Focus Sweep report.
+    FocusSweep(focus_sweep::Report),
+    /// Mirror Sweep report.
+    MirrorSweep(mirror_sweep::Report),
+    /// Overcapture report.
+    Overcapture(overcapture::Report),
+}
+
+/// Reports whether the corresponding frames were captured.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub enum CaptureFailureFeedbackMessage {
+    /// Poor image quality, possibly due to lightning
+    FaceOcclusionOrPoorLighting,
+    /// Standing too far from the Orb
+    TooFar,
+    /// Standing too close to the Orb
+    TooClose,
+    /// Eyes were occluded during capture
+    EyesOcclusion,
 }
 
 /// Biometric capture output.
@@ -105,6 +149,10 @@ pub struct Output {
     pub capture: Option<Capture>,
     /// Configuration history.
     pub log: Log,
+    /// User feedback messages in case of capture failure.
+    pub capture_failure_feedback_messages: Vec<CaptureFailureFeedbackMessage>,
+    /// Report of signup extension activity
+    pub extension_report: Option<ExtensionReport>,
 }
 
 /// Biometric capture plan.
@@ -112,6 +160,7 @@ pub struct Output {
 pub struct Plan {
     pub objectives: VecDeque<Objective>,
     target_left_eye: bool,
+    valid_capture_after: Instant,
     timeout: Fuse<Pin<Box<time::Sleep>>>,
     timed_out: bool,
     left_ir: Option<FrameInfoIr>,
@@ -119,6 +168,10 @@ pub struct Plan {
     right_ir: Option<FrameInfoIr>,
     right_rgb: Option<FrameInfoRgb>,
     self_custody_candidate_rgb: Option<FrameInfoSelfCustodyCandidate>,
+    face_ir: Option<camera::ir::Frame>,
+    thermal: Option<camera::thermal::Frame>,
+    last_face_ir: Option<camera::ir::Frame>,
+    last_thermal: Option<camera::thermal::Frame>,
     latitude: Option<f64>,
     longitude: Option<f64>,
     gps_points: usize,
@@ -127,6 +180,8 @@ pub struct Plan {
     occlusion_center_led_timer: InstantTimer,
     occlusion_30_filter: LowPassFilter,
     occlusion_indicator_on_time: Option<Instant>,
+    signup_extension_config: Option<qr_scan::user::SignupExtensionConfig>,
+    delay_between_eye_captures: Duration,
     mirror_offsets: Vec<mirror::Point>,
 }
 
@@ -146,14 +201,15 @@ type FrameInfoSelfCustodyCandidate =
     FrameInfo<face_identifier::types::IsValidOutput, camera::rgb::Frame>;
 
 struct FrameInfo<T, U> {
-    _timestamp: Instant,
+    #[allow(dead_code)]
+    timestamp: Instant,
     estimate: T,
     frame: U,
 }
 
 impl<T, U> FrameInfo<T, U> {
     fn new(estimate: T, frame: U) -> Self {
-        Self { _timestamp: Instant::now(), estimate, frame }
+        Self { timestamp: Instant::now(), estimate, frame }
     }
 }
 
@@ -182,20 +238,21 @@ impl OrbPlan for Plan {
                 let frame = frame.expect("frame must be set for an estimate output");
                 let valid_capture = estimate.score >= IRIS_SCORE_MIN
                     && (!orb.ir_auto_exposure.is_enabled()
-                        || IRIS_BRIGHTNESS_RANGE.contains(&frame.mean()));
+                        || IRIS_BRIGHTNESS_RANGE.contains(&frame.mean()))
+                    && self.valid_capture_after <= Instant::now();
 
                 if valid_capture {
                     let slot =
                         if self.target_left_eye { &mut self.left_ir } else { &mut self.right_ir };
                     if slot.is_none() {
-                        DATADOG.incr(
-                            "orb.main.count.signup.during.biometric_capture.\
+                        dd_incr!(
+                            "main.count.signup.during.biometric_capture.\
                              first_side_sharp_iris_detected",
-                            [format!(
+                            &format!(
                                 "side:{}",
                                 if self.target_left_eye { "left" } else { "right" }
-                            )],
-                        )?;
+                            )
+                        );
                     }
                     tracing::debug!("Found sharp iris: {}", estimate.score);
                     *slot = Some(FrameInfoIr::new(estimate, frame));
@@ -255,11 +312,31 @@ impl OrbPlan for Plan {
                         output,
                         frame.expect("frame must be set for FaceIdentifier::IsValidImage"),
                     ));
+                    self.face_ir = self.last_face_ir.take();
+                    self.thermal = self.last_thermal.take();
                 }
 
                 orb.only_rgb_net_frames = true;
             }
         }
+        Ok(BrokerFlow::Continue)
+    }
+
+    fn handle_ir_face_camera(
+        &mut self,
+        _orb: &mut Orb,
+        output: port::Output<camera::ir::Sensor>,
+    ) -> Result<BrokerFlow> {
+        self.last_face_ir = Some(output.value);
+        Ok(BrokerFlow::Continue)
+    }
+
+    fn handle_thermal_camera(
+        &mut self,
+        _orb: &mut Orb,
+        output: port::Output<camera::thermal::Sensor>,
+    ) -> Result<BrokerFlow> {
+        self.last_thermal = Some(output.value);
         Ok(BrokerFlow::Continue)
     }
 
@@ -276,10 +353,18 @@ impl OrbPlan for Plan {
             (&self.right_rgb, &self.right_ir)
         };
 
+        // TODO: Maybe we can refactor the following into "objectives termination conditions"? When we switch objectives
+        // we can call a function to check if we have completed the objective.
+
+        // Check if we have both the iris and the face.
         if let (Some(_rgb), Some(_ir)) = (rgb, ir) {
             if !self.is_last_objective() {
+                // We have completed scanning one side. It's ok for us to move forward even if we don't have the
+                // self-custody frame, as still have 1 more eye to capture.
                 return Ok(BrokerFlow::Break);
             }
+            // We are now in the last objective and we have completed scanning both sides. We Just need to make sure
+            // we have an self-custody frame before we completely exit the biometric capture phase.
             if self.self_custody_candidate_rgb.is_some() {
                 return Ok(BrokerFlow::Break);
             }
@@ -296,7 +381,12 @@ impl OrbPlan for Plan {
 impl Plan {
     /// Creates a new biometric capture plan.
     #[must_use]
-    pub fn new(wavelengths: &[(IrLed, u16)], timeout: Option<Duration>, _config: &Config) -> Self {
+    pub fn new(
+        wavelengths: &[(IrLed, u16)],
+        timeout: Option<Duration>,
+        signup_extension_config: Option<qr_scan::user::SignupExtensionConfig>,
+        _config: &Config,
+    ) -> Self {
         let target_left_eye: bool = random();
         let mut objectives = VecDeque::new();
         for (target_left_eye, only_rgb_net_frames) in
@@ -316,6 +406,7 @@ impl Plan {
         Self {
             objectives,
             target_left_eye: false,
+            valid_capture_after: Instant::now(),
             timeout: timeout
                 .map_or_else(Fuse::terminated, |timeout| Box::pin(time::sleep(timeout)).fuse()),
             timed_out: false,
@@ -324,6 +415,10 @@ impl Plan {
             right_ir: None,
             right_rgb: None,
             self_custody_candidate_rgb: None,
+            face_ir: None,
+            thermal: None,
+            last_face_ir: None,
+            last_thermal: None,
             latitude: None,
             longitude: None,
             gps_points: 0,
@@ -332,6 +427,8 @@ impl Plan {
             occlusion_center_led_timer: InstantTimer::default(),
             occlusion_30_filter: LowPassFilter::default(),
             occlusion_indicator_on_time: None,
+            signup_extension_config,
+            delay_between_eye_captures: DEFAULT_DELAY_BETWEEN_EYE_CAPTURES,
             mirror_offsets: Vec::new(),
         }
     }
@@ -349,7 +446,7 @@ impl Plan {
                 break;
             }
         }
-        self.run_post(orb).await
+        self.run_post(orb, None).await
     }
 
     pub(crate) async fn run_pre(&mut self, orb: &mut Orb) -> Result<()> {
@@ -359,9 +456,12 @@ impl Plan {
         orb.enable_rgb_net(false).await?; // Forward RGB frames to both RGB-Net and FaceIdentifier.
         orb.start_ir_eye_camera().await?;
         orb.start_ir_face_camera().await?;
-        orb.start_rgb_camera().await?;
+        orb.start_rgb_camera(RGB_FPS).await?;
         if orb.config.lock().await.thermal_camera {
             orb.start_thermal_camera().await?;
+        }
+        if orb.config.lock().await.depth_camera {
+            orb.start_depth_camera().await?;
         }
         orb.enable_mirror()?;
         orb.enable_distance()?;
@@ -383,23 +483,28 @@ impl Plan {
     }
 
     pub(crate) async fn run_check(&mut self, orb: &mut Orb) -> Result<bool> {
-        self.mirror_offsets.push(orb.mirror_offset.expect("already be populated"));
+        if let Some(mirror_offset) = orb.mirror_offset {
+            self.mirror_offsets.push(mirror_offset);
+        }
         if self.timed_out {
             tracing::info!("Biometric capture timeout");
             return Ok(true);
         }
         if !self.set_next_objective(orb).await? {
-            DATADOG.incr(
-                "orb.main.count.signup.during.biometric_capture.both_eye_captured",
-                NO_TAGS,
-            )?;
+            dd_incr!("main.count.signup.during.biometric_capture.both_eye_captured");
             tracing::info!("All objectives achieved");
+            orb.ui.biometric_capture_progress(1.1);
             return Ok(true);
         }
+        self.valid_capture_after = Instant::now() + self.delay_between_eye_captures;
         Ok(false)
     }
 
-    pub(crate) async fn run_post(mut self, orb: &mut Orb) -> Result<Output> {
+    pub(crate) async fn run_post(
+        mut self,
+        orb: &mut Orb,
+        extension_report: Option<ExtensionReport>,
+    ) -> Result<Output> {
         orb.disable_ir_net();
         orb.disable_rgb_net();
         orb.disable_ir_auto_exposure();
@@ -407,9 +512,12 @@ impl Plan {
         orb.stop_eye_tracker().await?;
         orb.try_enable_ir_auto_focus();
         orb.stop_ir_auto_focus().await?;
-        orb.stop_distance().await?;
+        let mut log_user_distance = orb.stop_distance().await?;
         if orb.thermal_camera.is_enabled() {
             orb.stop_thermal_camera().await?;
+        }
+        if orb.depth_camera.is_enabled() {
+            orb.stop_depth_camera().await?;
         }
         orb.stop_rgb_camera().await?;
         orb.try_enable_eye_pid_controller();
@@ -418,6 +526,16 @@ impl Plan {
         let log_ir_eye_camera = orb.stop_ir_eye_camera().await?;
         let log_ir_face_camera = orb.stop_ir_face_camera().await?;
         let log_main_mcu = orb.main_mcu.log_stop();
+
+        tracing::info!(
+            "Biometric capture completed with: Left iris score: {:?}, Right iris score: {:?}, \
+             Face self-custody score: {:?}",
+            self.left_ir.as_ref().map(|l| l.estimate.score),
+            self.right_ir.as_ref().map(|l| l.estimate.score),
+            self.self_custody_candidate_rgb.as_ref().map(|f| f.estimate.score),
+        );
+
+        let capture_failure_feedback_messages = self.failure_feedback(&mut log_user_distance);
 
         let mirror_offsets = take(&mut self.mirror_offsets);
         let capture = self.into_capture();
@@ -430,9 +548,10 @@ impl Plan {
             ir_face_camera: log_ir_face_camera,
             main_mcu: log_main_mcu,
             mirror: orb.stop_mirror().await?,
+            user_distance: log_user_distance,
         };
 
-        Ok(Output { capture, log })
+        Ok(Output { capture, log, capture_failure_feedback_messages, extension_report })
     }
 
     fn into_capture(self) -> Option<Capture> {
@@ -468,6 +587,8 @@ impl Plan {
         Some(Capture {
             eye_left,
             eye_right,
+            face_ir: self.face_ir,
+            thermal: self.thermal,
             latitude: self.latitude,
             longitude: self.longitude,
             face_self_custody_candidate: SelfCustodyCandidate {
@@ -515,11 +636,11 @@ impl Plan {
         let progress = (total_objective_progress * (MAX_PROGRESS - FACE_IDENTIFIED_PROGRESS))
             + self.self_custody_candidate_rgb.as_ref().map_or(0.0, |_| FACE_IDENTIFIED_PROGRESS);
         if self.objectives.len() <= self.total_objectives / 2 {
-            orb.led.biometric_capture_half_objectives_completed();
+            orb.ui.biometric_capture_half_objectives_completed();
         } else if self.objectives.is_empty() {
-            orb.led.biometric_capture_all_objectives_completed();
+            orb.ui.biometric_capture_all_objectives_completed();
         }
-        orb.led.biometric_capture_progress(progress);
+        orb.ui.biometric_capture_progress(progress);
     }
 
     #[allow(clippy::cast_precision_loss)]
@@ -561,11 +682,58 @@ impl Plan {
             };
         if occlusion_detected {
             self.occlusion_indicator_on_time.get_or_insert_with(Instant::now);
-            orb.led.biometric_capture_occlusion(true);
+            orb.ui.biometric_capture_occlusion(true);
         } else {
-            orb.led.biometric_capture_occlusion(false);
+            orb.ui.biometric_capture_occlusion(false);
             self.occlusion_indicator_on_time = None;
         }
+    }
+
+    fn failure_feedback(
+        &self,
+        user_distance: &mut distance::Log,
+    ) -> Vec<CaptureFailureFeedbackMessage> {
+        if self.is_success() {
+            return Vec::new();
+        }
+
+        let avg_user_distance = {
+            let (sum, count) = user_distance
+                .user_distance
+                .values()
+                .filter(|d| !d.is_nan())
+                .fold((0.0, 0), |(sum, count), &d| (sum + d, count + 1));
+            if count > 0 {
+                sum / f64::from(count)
+            } else {
+                (IR_FOCUS_RANGE.start() + IR_FOCUS_RANGE.end()) / 2.0
+            }
+        };
+
+        let mut messages = Vec::new();
+        if avg_user_distance >= *IR_FOCUS_RANGE.end() {
+            messages.push(CaptureFailureFeedbackMessage::TooFar);
+        } else if avg_user_distance <= *IR_FOCUS_RANGE.start() {
+            messages.push(CaptureFailureFeedbackMessage::TooClose);
+        }
+        if self.left_ir.is_none() || self.right_ir.is_none() {
+            messages.push(CaptureFailureFeedbackMessage::EyesOcclusion);
+        }
+        if self.left_rgb.is_none()
+            || self.right_rgb.is_none()
+            || self.self_custody_candidate_rgb.is_none()
+        {
+            messages.push(CaptureFailureFeedbackMessage::FaceOcclusionOrPoorLighting);
+        }
+        messages
+    }
+
+    fn is_success(&self) -> bool {
+        self.left_ir.is_some()
+            && self.right_ir.is_some()
+            && self.left_rgb.is_some()
+            && self.right_rgb.is_some()
+            && self.self_custody_candidate_rgb.is_some()
     }
 }
 
@@ -578,35 +746,30 @@ impl Plan {
 /// slight adjustment to the PWM angle offsets, so the next time
 /// [`eye_pid_controller`](crate::agents::eye_pid_controller) makes smaller
 /// offsets.
-///
-/// # Panics
-///
-/// If `mirror_offsets` contains less than 2 points.
 pub async fn continuous_calibration(
     orb: &mut Orb,
     mirror_offsets: Vec<mirror::Point>,
 ) -> Result<()> {
     tracing::info!("Mirror offsets after successful capture: {mirror_offsets:?}");
-    let horizontal = mirror_offsets
+    if mirror_offsets.len() < 2 {
+        return Ok(());
+    }
+    let phi_degrees = mirror_offsets
         .iter()
-        .map(|point| point.horizontal)
+        .map(|point| point.phi_degrees)
         .min_by_key(|x| OrderedFloat(x.abs()))
         .expect("to contain at least two points");
-    let vertical = mirror_offsets
+    let theta_degrees = mirror_offsets
         .iter()
-        .map(|point| point.vertical)
+        .map(|point| point.theta_degrees)
         .min_by_key(|x| OrderedFloat(x.abs()))
         .expect("to contain at least two points");
-    DATADOG
-        .gauge("orb.main.gauge.signup.pid.success", horizontal.to_string(), ["type:horizontal"])
-        .or_log();
-    DATADOG
-        .gauge("orb.main.gauge.signup.pid.success", vertical.to_string(), ["type:vertical"])
-        .or_log();
+    dd_gauge!("main.gauge.signup.pid.success", phi_degrees.to_string(), "type:phi_degrees");
+    dd_gauge!("main.gauge.signup.pid.success", theta_degrees.to_string(), "type:theta_degrees");
     let mut calibration = orb.calibration().clone();
-    calibration.mirror.horizontal_offset += horizontal * CONTINUOUS_CALIBRATION_REDUCER;
-    calibration.mirror.vertical_offset += vertical * CONTINUOUS_CALIBRATION_REDUCER;
-    calibration.store().await?;
+    calibration.mirror.phi_offset_degrees += phi_degrees * CONTINUOUS_CALIBRATION_REDUCER;
+    calibration.mirror.theta_offset_degrees += theta_degrees * CONTINUOUS_CALIBRATION_REDUCER;
+    calibration.store(CALIBRATION_FILE_PATH).await?;
     orb.recalibrate(calibration).await?;
     Ok(())
 }

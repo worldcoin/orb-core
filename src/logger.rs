@@ -1,42 +1,151 @@
 //! Logging support.
 
-use dogstatsd::{Client, DogstatsdResult, Options};
+use crate::agents::PROCESS_DOGSTATSD_ENV;
+use dogstatsd::{Client, Options};
+use eyre::Result;
 use flexi_logger::{
     filter::{LogLineFilter, LogLineWriter},
     style, DeferredNow, Level, Logger, Record,
 };
 use libc::{isatty, STDOUT_FILENO};
 use once_cell::sync::Lazy;
-use std::{fmt::Arguments, io::prelude::*, sync::OnceLock, thread};
+use std::{
+    env,
+    fmt::Arguments,
+    fs::OpenOptions,
+    io::Write,
+    net::UdpSocket,
+    os::fd::FromRawFd,
+    path::Path,
+    process::Output,
+    sync::{atomic::AtomicBool, OnceLock},
+    thread,
+    time::{Duration, Instant, SystemTime},
+};
+use time::{format_description, OffsetDateTime};
+
+/// The global suppress flag for datadog metrics.
+pub static DATADOG_SUPPRESS: AtomicBool = AtomicBool::new(false);
+
+/// Helper macro to increment a datadog counter.
+#[macro_export]
+macro_rules! dd_incr {
+    (
+        $key:literal $(+ format !($str:literal $(, $($arg:tt)*)?))?
+        $(, $tag:expr)*
+        $(; $tags:expr)?
+    ) => {
+        if !$crate::logger::DATADOG_SUPPRESS.load(std::sync::atomic::Ordering::Relaxed) {
+            #[allow(unused_variables)]
+            let tags: &[&str] = &[$($tag),*];
+            $(let tags = $tags;)?
+            #[allow(unused_variables)]
+            let key: &str = concat!("orb.", $key);
+            $(let key = &format!(concat!("orb.", $key, ".", $str) $(, $($arg)*)?);)?
+            if let Err(err) = $crate::logger::DATADOG.incr(key, tags) {
+                ::tracing::error!("Datadog incr reporting failed with error: {err:#?}");
+            }
+        }
+    };
+}
+
+/// Helper macro to send a datadog timing metric.
+#[macro_export]
+macro_rules! dd_timing {
+    (
+        $key:literal $(+ format !($str:literal $(, $($arg:tt)*)?))?,
+        $t:expr
+        $(, $tag:expr)*
+        $(; $tags:expr)?
+    ) => {
+        if !$crate::logger::DATADOG_SUPPRESS.load(std::sync::atomic::Ordering::Relaxed) {
+            #[allow(unused_variables)]
+            let tags: &[&str] = &[$($tag),*];
+            $(let tags = $tags;)?
+            #[allow(unused_variables)]
+            let key: &str = concat!("orb.", $key);
+            $(let key = &format!(concat!("orb.", $key, ".", $str) $(, $($arg)*)?);)?
+            if let Err(err) =
+                $crate::logger::DATADOG.timing(key, $crate::logger::TimeElapsed::elapsed(&$t), tags)
+            {
+                ::tracing::error!("Datadog timing reporting failed with error: {err:#?}");
+            }
+        }
+    };
+}
+
+/// Helper macro to send a datadog gauge metric.
+#[macro_export]
+macro_rules! dd_gauge {
+    (
+        $key:literal $(+ format !($str:literal $(, $($arg:tt)*)?))?,
+        $value:expr
+        $(, $tag:expr)*
+        $(; $tags:expr)?
+    ) => {
+        if !$crate::logger::DATADOG_SUPPRESS.load(std::sync::atomic::Ordering::Relaxed) {
+            #[allow(unused_variables)]
+            let tags: &[&str] = &[$($tag),*];
+            $(let tags = $tags;)?
+            #[allow(unused_variables)]
+            let key: &str = concat!("orb.", $key);
+            $(let key = &format!(concat!("orb.", $key, ".", $str) $(, $($arg)*)?);)?
+            if let Err(err) = $crate::logger::DATADOG.gauge(key, $value, tags) {
+                ::tracing::error!("Datadog gauge reporting failed with error: {err:#?}");
+            }
+        }
+    };
+}
+
+/// Helper macro to send a datadog count metric.
+#[macro_export]
+macro_rules! dd_count {
+    (
+        $key:literal $(+ format !($str:literal $(, $($arg:tt)*)?))?,
+        $value:expr
+        $(, $tag:expr)*
+        $(; $tags:expr)?
+    ) => {
+        if !$crate::logger::DATADOG_SUPPRESS.load(std::sync::atomic::Ordering::Relaxed) {
+            #[allow(unused_variables)]
+            let tags: &[&str] = &[$($tag),*];
+            $(let tags = $tags;)?
+            #[allow(unused_variables)]
+            let key: &str = concat!("orb.", $key);
+            $(let key = &format!(concat!("orb.", $key, ".", $str) $(, $($arg)*)?);)?
+            if let Err(err) = $crate::logger::DATADOG.count(key, $value, tags) {
+                ::tracing::error!("Datadog count reporting failed with error: {err:#?}");
+            }
+        }
+    };
+}
 
 /// Orb identification code.
 pub static DATADOG: Lazy<Client> = Lazy::new(init_datadog_client);
 
-/// Removes the need to put` &[] as &[&str]` everywhere.
-pub const NO_TAGS: &[&str] = &[];
+fn try_create_datadog_client_from_socket() -> Option<Client> {
+    if let Ok(fd) = env::var(PROCESS_DOGSTATSD_ENV) {
+        let sock = unsafe { UdpSocket::from_raw_fd(fd.parse().ok()?) };
+        return sock.try_into().ok();
+    }
+    None
+}
 
-fn init_datadog_client() -> Client {
+/// This should only be used before forking a new process-agent. Creates a default datadog client. This default datadog client creates a new FD socket to connect to the actual datadog daemon. This new open socket can be consecutively used by orb-core's process-agents that are inside a network namespace.
+#[must_use]
+pub fn create_default_datadog_client() -> Client {
     let datadog_options = Options::default();
     Client::new(datadog_options).unwrap()
 }
 
-/// Helper macro to get the elapsed time in milliseconds and as an i64 from SystemTime.
-/// In case of error, it defaults to `i64::MAX`.
-macro_rules! sys_elapsed {
-    ($e:expr) => {
-        $e.elapsed().unwrap_or(std::time::Duration::MAX).as_millis().try_into().unwrap_or(i64::MAX)
-    };
+/// We currently have two methods for establishing a connection to the Datadog daemon:
+///
+/// 1) The main process of orb-core initiates a new client with a UDP socket that connects to the daemon.
+///
+/// 2) orb-mega-agents run within a network namespace (sandbox), unable to connect to the daemon. They expect a socket passed down from their parent (the main orb-core process). This socket is created in orb-core right before the agent's spawn.
+fn init_datadog_client() -> Client {
+    try_create_datadog_client_from_socket().unwrap_or_else(create_default_datadog_client)
 }
-pub(crate) use sys_elapsed;
-
-/// Helper macro to get the elapsed time in milliseconds and as an i64 from Instant.
-/// In case of error, it defaults to `i64::MAX`.
-macro_rules! inst_elapsed {
-    ($e:expr) => {
-        $e.elapsed().as_millis().try_into().unwrap_or(i64::MAX)
-    };
-}
-pub(crate) use inst_elapsed;
 
 const DEFAULT_LOG_LEVEL: &str = "debug";
 
@@ -56,17 +165,27 @@ impl LogLineFilter for InternalOnly {
     }
 }
 
-/// A trait for logging errors instead of propagating the error with `?`.
-pub trait LogOnError {
-    /// Logs an error message to the default logger at the `Error` level.
-    fn or_log(&self);
+/// A helper trait to get the elapsed time in milliseconds as an i64.
+pub trait TimeElapsed {
+    /// Gets the time elapsed in milliseconds as an i64.
+    fn elapsed(&self) -> i64;
 }
 
-impl LogOnError for DogstatsdResult {
-    fn or_log(&self) {
-        if let Err(e) = self {
-            tracing::error!("Datadog reporting failed with error: {e:#?}");
-        }
+impl TimeElapsed for Instant {
+    fn elapsed(&self) -> i64 {
+        self.elapsed().as_millis().try_into().unwrap_or(i64::MAX)
+    }
+}
+
+impl TimeElapsed for SystemTime {
+    fn elapsed(&self) -> i64 {
+        self.elapsed().unwrap_or(Duration::MAX).as_millis().try_into().unwrap_or(i64::MAX)
+    }
+}
+
+impl TimeElapsed for Duration {
+    fn elapsed(&self) -> i64 {
+        self.as_millis().try_into().unwrap_or(i64::MAX)
     }
 }
 
@@ -178,5 +297,24 @@ fn agent_format(
         &record.args()
     );
     write!(w, "{}", style(level).paint(log))?;
+    Ok(())
+}
+
+/// Append formatted command output to a log file.
+pub fn log_to_file(log_path: &Path, command: &str, output: &Output) -> Result<()> {
+    let timestamp = OffsetDateTime::now_utc()
+        .format(&format_description::well_known::Rfc3339)
+        .unwrap_or_else(|_| "unknown time".to_string());
+
+    let message = format!(
+        "{} - Error executing '{}': \nSTDOUT:\n{}\nSTDERR:\n{}",
+        timestamp,
+        command,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let mut log_file = OpenOptions::new().create(true).append(true).open(log_path)?;
+    writeln!(log_file, "{message}")?;
     Ok(())
 }

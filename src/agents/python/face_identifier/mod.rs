@@ -1,45 +1,45 @@
 //! Face identifier python agent.
 
+#![allow(clippy::unused_self, clippy::unnecessary_wraps, clippy::needless_pass_by_value)] // foss
 #![allow(clippy::used_underscore_binding)] // triggered by rkyv
-#![allow(
-    clippy::needless_pass_by_value,
-    clippy::unnecessary_wraps,
-    clippy::unused_self,
-    unused_variables
-)]
 
 /// Face identifier python agent types.
 pub mod types;
 
-pub use types::Bundle;
+pub use types::{Bundle, FraudChecks};
+use types::{Embedding, Thumbnail};
 
-use self::types::{BackendConfig, Embedding, IsValidOutput, Thumbnail};
+use self::types::{BackendConfig, IsValidOutput};
 use crate::{
     agents::{
         camera,
         python::{rgb_net, AgentPython},
-        Agent,
+        ProcessInitializer,
     },
     config::Config,
     consts::{RGB_NATIVE_HEIGHT, RGB_NATIVE_WIDTH},
-    inst_elapsed,
-    logger::{LogOnError, DATADOG, NO_TAGS},
-    port::{Port, SharedPort},
+    dd_timing,
 };
-use eyre::Result;
+use agentwire::{
+    agent::{self, Agent as _},
+    port::{self, Port, SharedPort},
+};
+use ai_interface::PyError;
+use eyre::{Error, Result};
 use ndarray::{Array, Array3};
 use pyo3::{prelude::*, types::PyDict};
-use python_agent_interface::PyError;
 use rkyv::{Archive, Deserialize, Infallible, Serialize};
 use schemars::JsonSchema;
 use serde::Serialize as SerdeSerialize;
-use std::time::Instant;
+use std::{collections::HashMap, time::Instant};
 
 /// Face identifier python agent.
 ///
 /// See [the module-level documentation](self) for details.
 #[derive(Clone, Debug, Archive, Serialize, Deserialize, SerdeSerialize, JsonSchema)]
-pub struct Model {}
+pub struct Model {
+    configs: Option<HashMap<String, String>>,
+}
 
 /// Agent input.
 #[derive(Debug, Archive, Serialize)]
@@ -47,6 +47,8 @@ pub struct Model {}
 pub enum Input {
     /// Face identifier similarity score.
     Estimate {
+        /// The signup id of this signup attempt.
+        signup_id: String,
         /// Left face RGB frame.
         frame_left: camera::rgb::Frame,
         /// Right face RGB frame.
@@ -85,8 +87,10 @@ pub enum Input {
 #[derive(Debug, Archive, Serialize, Deserialize)]
 #[allow(clippy::large_enum_variant)]
 pub enum Output {
-    /// Face identifier bundle generation.
+    /// Face identifier fraud checks and bundle generation.
     Estimate {
+        /// Face identifier fraud checks.
+        fraud_checks: FraudChecks,
         /// Face identifier bundle that includes the face identifier image and embeddings.
         bundle: Bundle,
     },
@@ -115,13 +119,13 @@ impl Port for Model {
 }
 
 impl SharedPort for Model {
-    const SERIALIZED_CONFIG_EXTRA_SIZE: usize = 8192;
+    const SERIALIZED_INIT_SIZE: usize = 8192;
     const SERIALIZED_INPUT_SIZE: usize =
         4096 + RGB_NATIVE_HEIGHT as usize * RGB_NATIVE_WIDTH as usize * 3;
     const SERIALIZED_OUTPUT_SIZE: usize = 4096;
 }
 
-impl super::Agent for Model {
+impl agentwire::Agent for Model {
     const NAME: &'static str = "face-identifier";
 }
 
@@ -131,6 +135,7 @@ impl super::Environment<Model> for Environment<'_> {
 
         let (op, res) = match input {
             ArchivedInput::Estimate {
+                signup_id,
                 frame_left,
                 frame_right,
                 frame_self_custody_candidate,
@@ -144,6 +149,7 @@ impl super::Environment<Model> for Environment<'_> {
                 "estimate",
                 self.estimate(
                     py,
+                    signup_id,
                     frame_left,
                     frame_right,
                     frame_self_custody_candidate,
@@ -173,14 +179,13 @@ impl super::Environment<Model> for Environment<'_> {
             ArchivedInput::Warmup => ("warmup", self.warmup().map(|()| Output::Warmup)),
         };
 
-        DATADOG
-            .timing(
-                format!("orb.main.time.processing.{}.{}", Model::DD_NS, op),
-                inst_elapsed!(t),
-                NO_TAGS,
-            )
-            .or_log();
-        tracing::info!("Python agent {}::{} <benchmark>: {} ms", Model::NAME, op, inst_elapsed!(t));
+        dd_timing!("main.time.processing" + format!("{}.{}", Model::DD_NS, op), t);
+        tracing::info!(
+            "Python agent {}::{} <benchmark>: {} ms",
+            Model::NAME,
+            op,
+            t.elapsed().as_millis()
+        );
 
         res.or_else(|e| {
             if let Some(pe) = e.downcast_ref::<PyErr>() {
@@ -196,21 +201,19 @@ impl super::Environment<Model> for Environment<'_> {
 impl Environment<'_> {
     /// Create a new python agent environment.
     pub fn new<'a>(py: Python<'a>, configs: &'_ Model) -> Result<Environment<'a>> {
-        tracing::info!("{} agent: loading model with config: {:?}", Model::NAME, configs);
+        tracing::info!("{} agent: loading model with config: {:?}", Model::NAME, configs.configs);
+        #[cfg(feature = "integration_testing")]
+        if cfg!(feature = "integration_testing") {
+            return Ok(Environment { agent: PyDict::new(py) });
+        }
         let t = Instant::now();
 
         tracing::info!(
             "Python agent {} <benchmark>: initialization done in {} ms",
             Model::NAME,
-            inst_elapsed!(t)
+            t.elapsed().as_millis()
         );
-        DATADOG
-            .timing(
-                format!("orb.main.time.neural_network.init.{}", Model::DD_NS),
-                inst_elapsed!(t),
-                NO_TAGS,
-            )
-            .or_log();
+        dd_timing!("main.time.neural_network.init" + format!("{}", Model::DD_NS), t);
 
         Ok(Environment { agent: PyDict::new(py) })
     }
@@ -220,9 +223,11 @@ impl Environment<'_> {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[allow(unused_variables)]
     fn estimate(
         &self,
         py: Python,
+        signup_id: &str,
         left: &camera::rgb::ArchivedFrame,
         right: &camera::rgb::ArchivedFrame,
         self_custody_candidate: &camera::rgb::ArchivedFrame,
@@ -253,10 +258,12 @@ impl Environment<'_> {
                 }]),
                 inference_backend: Some("orb-core-base".into()),
             },
+            fraud_checks: FraudChecks::default(),
         })
     }
 
     /// Check if the RGB face image meets our quality standards.
+    #[allow(unused_variables)]
     pub fn is_valid(
         &self,
         py: Python,
@@ -288,8 +295,20 @@ impl super::AgentPython for Model {
     }
 }
 
+impl agentwire::agent::Process for Model {
+    type Error = Error;
+
+    fn run(self, port: port::RemoteInner<Self>) -> Result<(), Self::Error> {
+        self.run_python_process(port)
+    }
+
+    fn initializer() -> impl agent::process::Initializer {
+        ProcessInitializer::default()
+    }
+}
+
 impl From<&Config> for Model {
     fn from(config: &Config) -> Self {
-        Self {}
+        Self { configs: config.face_identifier_model_configs.face_identifier_model_configs.clone() }
     }
 }

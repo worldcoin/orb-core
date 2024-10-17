@@ -1,130 +1,167 @@
 [workspace]
-resolver = "2"
 members = [
-    "python-agent-interface",
+    "agentwire",
+    "agentwire/macros",
+    "ai-interface",
     "alsa-sys",
     "camera",
     "can",
     "ir-net",
-    "macros",
+    "livestream-client",
+    "livestream-event",
+    "orb-backend-connect",
     "orb-id",
+    "orb-relay-client",
     "rgb-net",
+    "royale-sys",
+    "royale",
     "seekcamera-sys",
     "seekcamera",
-    "sound",
     "tmp-tracing",
-    "uart",
     "v4l2-sys",
     "wld-data-id",
     "wpa-supplicant-interface",
+    "fraud-engine",
 ]
+default-members = [".", "orb-backend-connect"]
 
 [workspace.package]
 edition = "2021"
 license = "MIT OR (Apache-2.0 WITH LLVM-exception)"
 repository = "https://github.com/worldcoin/orb-core"
-rust-version = "1.75.0"
 
 [workspace.dependencies]
-bindgen = "0.66.1"
+bindgen = "0.69.4"
+cc = "1.0.89"
+clap = { version = "3.2.23", features = ["derive"] }
 color-eyre = "0.6"
+eframe = { version = "0.27.2", default-features = false, features = ["default_fonts", "wayland", "x11", "wgpu"] }
+egui = "0.27.2"
+egui-phosphor = "0.5.0"
+egui-wgpu = "0.27.2"
 eyre = "0.6"
-log = "0.4"
+flexi_logger = { version = "0.28", features = ["compress"] }
+futures = "0.3"
+gstreamer = "0.22.3"
+gstreamer-app = "0.22.0"
+gstreamer-video = "0.22.1"
+libc = "0.2.93"
+log = "=0.4.21"                                                                                                   # 0.4.22 breaks logging
 ndarray = { version = "0.15.3", features = ["serde"] }
 numpy = "0.19"
 pyo3 = { version = "0.19", features = ["auto-initialize"] }
 rkyv = "0.7.40"
 rusty-fork = "0.3"
 schemars = "0.8.12"
-serde_json = "1.0"
 serde = { version = "1.0", features = ["derive", "rc"] }
+serde_json = "1.0"
+sodiumoxide = "0.2.7"
 tempfile = "3"
 thiserror = "1"
-tracing = { package = "tmp-tracing", path = "tmp-tracing" } # Temorary fake alias until we fully migrate
+tokio = { version = "1", features = ["full"] }
+tokio-stream = { version = "0.1.7", features = ["sync", "fs"] }
+tokio-util = { version = "0.7.12" }
+tonic = { version = "0.12.2", features = ["tls"] }
+tracing = { package = "tmp-tracing", path = "tmp-tracing" }                                                       # Temorary fake alias until we fully migrate
+zmq = "0.10.0"
+
+# First party workspace crates
+v4l2-sys.path = "v4l2-sys"
 
 [workspace.dependencies.orb-messages]
-git = "https://github.com/worldcoin/orb-messages"
-rev = "6a2b74da2f390dd927d5172de4cb72a3928814e6"
+git = "https://github.com/worldcoin/orb-messages.git"
+rev = "ac7246ffdb7b03def49b92a05f1e8ad578bc56ab"
 
 [workspace.dependencies.orb-qr-link]
 git = "https://github.com/worldcoin/orb-software"
-rev = "05cd57bb16b1635bbb1fa7bb0b5319ad095f647d"
+rev = "2880595651da546eea5069e2baca25b377944901"
 default-features = false
 features = ["decode"]
 
 [workspace.dependencies.orb-endpoints]
 git = "https://github.com/worldcoin/orb-software"
-rev = "05cd57bb16b1635bbb1fa7bb0b5319ad095f647d"
+rev = "828e47cc18d304b084208394d9435d60c3c5ab3c"
+
+[workspace.dependencies.orb-security-utils]
+git = "https://github.com/worldcoin/orb-software"
+rev = "9a3eb4ec501468b1eff6587f9ed0938b76faaa36"
+default-features = false
+features = ["reqwest"]
+
+[workspace.dependencies.orb-relay-messages]
+git = "https://github.com/worldcoin/orb-relay-messages.git"
+rev = "f1c73751200ea9df7f1712ec203c7882f30f60f4"
+features = ["client"]
 
 [package]
 name = "orb"
-version = "0.0.0"
-authors = [
-    "Saturnin Pugnet",
-    "Valentine Valyaeff <valentine.valyaeff@gmail.com>",
-]
+version = "0.1.0"
+authors = ["Saturnin Pugnet", "Valentine Valyaeff <valentine.valyaeff@gmail.com>"]
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
 description = """
 The rust main program running on the orb and responsible for signup and other
 main behaviors of the orb.
 """
-readme = "README.md"
-
-edition.workspace = true
-license.workspace = true
-repository.workspace = true
-rust-version.workspace = true
 publish = false
 
+# All of these features except v2_x_x are used for internal development ONLY. They are not used for normal orbs.
 [features]
-default = ["stage"]
-cuda-test = []
+default = ["v2_x_x", "stage"]
+# Orb Versioning - https://www.notion.so/Orb-Versioning-3c1f92d3efc344e9a5c35902aa6bafb5
+v2_x_x = [] # EV1 and EV2
+# v2_0_x DEPRECATED Proto 2
+# v1_x_x DEPRECATED Proto 1
+# v0_2_x DEPRECATED Proto 0 Sustaining 1
+# v0_1_x DEPRECATED Proto 0 Sustaining 0
+allow-plan-mods = []                                                        # Allows modifications to the plans.
+cuda-test = ["orb-rgb-net/cuda-test", "orb-ir-net/cuda-test"]
+debug-eye-tracker = []                                                      # Enables println outputs in eye_tracker.rs
+integration_testing = []                                                    # Enable hacks for passing integration tests on CI
+internal-data-acquisition = []                                              # Advanced and verbose imaging for R&D purposes.
+livestream = ["dep:egui", "dep:egui-wgpu", "dep:egui-phosphor"]             # Enable livestream agent to debug cameras
+log-iris-data = []                                                          # Allows logging of iris codes and mask codes
 no-image-encryption = []
-log-iris-data = []               # Allows logging of iris codes and mask codes
-stage = ["dep:local-ip-address"] # Use staging backend
-ui-test = []                     # overwritten random backend responses to generate successful signups and test UI
+internal-pcp-export = []
+internal-pcp-no-encryption = []
+skip-user-qr-validation = ["internal-pcp-export", "internal-pcp-no-encryption"]
+stage = ["dep:local-ip-address", "livestream", "agentwire/sandbox-network"] # Use staging backend
+ui-test-successful-signup = []                                              # Emulate successful signups and test UI
 
-[dependencies.python-agent-interface]
-path = "python-agent-interface"
-version = "0.1.0"
+[dependencies.agentwire]
+path = "agentwire"
 
-[dependencies.orb-macros]
-path = "macros"
-version = "0.1.0"
+[dependencies.ai-interface]
+path = "ai-interface"
 
 [dependencies.orb-camera]
 path = "camera"
-version = "0.1.0"
+
+[dependencies.orb-royale]
+path = "royale"
 
 [dependencies.orb-seekcamera]
 path = "seekcamera"
 
-[dependencies.orb-sound]
-path = "sound"
-version = "0.1.0"
-
 [dependencies.orb-can]
 path = "can"
-version = "0.1.0"
-
-[dependencies.orb-uart]
-path = "uart"
-version = "0.1.0"
 
 [dependencies.orb-rgb-net]
 path = "rgb-net"
-version = "0.1.0"
+
+[dependencies.orb-relay-client]
+path = "orb-relay-client"
 
 [dependencies.orb-ir-net]
 path = "ir-net"
-version = "0.1.0"
 
 [dependencies.orb-wld-data-id]
 path = "wld-data-id"
-version = "0.1.0"
 
-[dependencies.v4l2-sys]
-path = "v4l2-sys"
-version = "0.1.0"
+[dependencies.livestream-event]
+path = "livestream-event"
 
 [dependencies.opencv]
 git = "https://github.com/twistedfall/opencv-rust"
@@ -132,40 +169,55 @@ tag = "v0.82.0"
 default-features = false
 features = ["clang-runtime", "calib3d", "imgproc", "objdetect"]
 
+[dependencies.hyrax]
+git = "https://github.com/worldcoin/hyrax-pcs-commit.git"
+rev = "ec5f1120e394643ad09990a34815dd11e9122366"
+
+[dependencies.iris-mpc]
+git = "https://github.com/worldcoin/iris-mpc.git"
+rev = "0036bbabb15b97a0359172b91682b00e2ae442df"
+package = "iris-mpc-common"
+
 [dependencies]
-async-trait = "0.1"
+base64 = "0.22"
+bincode = "1.3"
 bytesize = { version = "1.2.0", features = ["serde"] }
-clap = { version = "3.2.23", features = ["derive"] }
+clap.workspace = true
 close_fds = "0.3.2"
 color-eyre.workspace = true
 const_format = "0.2.30"
+crc32fast = "1.4.0"
 dashmap = "5.3.4"
 data-encoding = "2.3"
 derivative = "2"
-dogstatsd = "0.7.1"
-egui = "0.19.0"
-egui-wgpu = "0.19.0"
+dogstatsd = { version = "0.11.2", git = "https://github.com/worldcoin/dogstatsd-rs.git", rev = "3db433ce8f842adb2460c91c72554a41dfac93de" }
+egui = { workspace = true, optional = true }
+egui-phosphor = { workspace = true, optional = true }
+egui-wgpu = { workspace = true, optional = true }
 eyre.workspace = true
-flate2 = "1.0.20"
-flexi_logger = { version = "0.25.1", features = ["compress"] }
+flate2 = "1.0"
+flexi_logger.workspace = true
 fs_extra = "1.3.0"
-futures = "0.3"
-gstreamer = "0.20.0"
-gstreamer-app = "0.20.0"
-gstreamer-video = "0.20.1"
-hex-literal = "0.3.4"
+futures.workspace = true
+gstreamer-app.workspace = true
+gstreamer-video.workspace = true
+gstreamer.workspace = true
 hex = "0.4"
-lazy_static = "1"
-libc = "0.2.93"
+libc.workspace = true
+libsecp256k1 = { version = "0.7.1", default-features = false, features = ["sha2", "static-context"] }
 local-ip-address = { version = "0.5.1", optional = true }
 mockall = "0.11.3"
 ndarray.workspace = true
-nix = { version = "0.26.2", default-features = false, features = ["signal", "fs", "mman", "sched"] }
+nix = { version = "0.26.2", default-features = false }
 nmea-parser = "0.10.0"
 nom = "7.1.1"
 numpy.workspace = true
 once_cell = "1.12.0"
-openssl = "0.10.55"
+orb-endpoints.workspace = true
+orb-messages.workspace = true
+orb-qr-link.workspace = true
+orb-relay-messages.workspace = true
+orb-security-utils.workspace = true
 ordered-float = "3.4.0"
 pnet = { version = "0.34.0", features = ["std"] }
 png = "0.16.8"
@@ -174,27 +226,28 @@ pyo3.workspace = true
 rand = "0.8.4"
 rand_distr = "0.4.2"
 regex = "1.7.0"
-reqwest = { version = "0.11", features = ["multipart", "json", "gzip"] }
-ring = "0.16"
-rkyv.workspace = true
+reqwest = { version = "0.11", features = ["multipart", "json", "gzip", "rustls-tls-manual-roots"], default-features = false }
+ring = "0.17"
+rkyv = { workspace = true, features = ["alloc", "validation"] }
 semver = "1.0"
+serde-big-array = "0.5"
 serde.workspace = true
 serde_json.workspace = true
-shell-words = "1.1.0"
-sodiumoxide = "0.2.7"
+socket2 = "0.5.4"
+sodiumoxide.workspace = true
 tar = "0.4.40"
+tempfile.workspace = true
 termion = "2.0.1"
 thiserror.workspace = true
 time = { version = "0.3", features = ["formatting"] }
-tokio = { version = "1", features = ["full"] }
-tokio-stream = { version = "0.1.7", features = ["sync", "fs"] }
+tokio-stream.workspace = true
+tokio-util.workspace = true
+tokio.workspace = true
 tracing.workspace = true
+v4l2-sys.workspace = true
 walkdir = "2.3.2"
 zbus = { version = "3.10.0", default-features = false, features = ["tokio"] }
-zmq = "0.10.0"
-orb-messages.workspace = true
-orb-endpoints.workspace = true
-orb-qr-link.workspace = true
+zmq.workspace = true
 
 # `opencv` transitive dependencies.
 # We don't use these in orb-core, but because of strange `opencv` build script,
@@ -205,19 +258,27 @@ matches = "0.1"
 rgb = "0.8.20"
 schemars.workspace = true
 sha2 = "0.10.6"
-rs_merkle = "1.4.1"
 rxing = "0.4.11"
 image = "0.24.7"
 
 [dev-dependencies]
 approx = "0.5.0"
-mock_instant = "0.2"
+mock_instant = "0.4"
+openssl = "0.10"
 
 [build-dependencies]
 color-eyre.workspace = true
-prost-build = "0.12.3"
+prost-build = "0.13"
+toml = "0.8"
 
 [profile.dev-release]
 inherits = "release"
 overflow-checks = true
 debug-assertions = true
+
+# lto not supported in package profiles: https://github.com/rust-lang/cargo/issues/9330 and this:
+# https://github.com/rust-lang/cargo/issues/8264
+# lto = true
+
+[profile.release.package.orb-backend-connect]
+strip = "symbols"

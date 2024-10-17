@@ -4,10 +4,10 @@
 #![warn(clippy::pedantic)]
 #![allow(clippy::doc_markdown, clippy::missing_errors_doc)]
 
+use ai_interface::InitAgent;
 use eyre::{Result, WrapErr};
 use numpy::PyArray2;
 use pyo3::{prelude::*, types::PyDict};
-use python_agent_interface::InitAgent;
 
 /// IR-Net.
 pub struct IrNet<'p> {

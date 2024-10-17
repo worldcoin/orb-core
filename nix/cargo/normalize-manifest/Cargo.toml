@@ -1,0 +1,11 @@
+[workspace]
+
+[package]
+name = "normalize-manifest"
+version = "0.1.0"
+authors = ["Valentine Valyaeff <valentine.valyaeff@gmail.com>"]
+edition = "2021"
+publish = false
+
+[dependencies]
+toml = "0.8.19"

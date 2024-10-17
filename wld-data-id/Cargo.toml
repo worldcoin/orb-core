@@ -2,8 +2,9 @@
 name = "orb-wld-data-id"
 version = "0.1.0"
 authors = ["Dan Girshovich"]
-edition = "2021"
+edition.workspace = true
 license.workspace = true
+publish = false
 
 [dependencies]
 bincode = "1.3.3"

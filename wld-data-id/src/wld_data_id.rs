@@ -3,7 +3,7 @@ use eyre::{eyre, Error, Result};
 use rand::prelude::*;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use std::{convert::TryInto, fmt, path::Path, str::FromStr, time::Duration};
+use std::{fmt, path::Path, str::FromStr};
 use uuid::Uuid;
 
 const VERSION: u8 = 0;
@@ -93,12 +93,9 @@ pub struct ImageId(WldDataId);
 impl ImageId {
     /// Generates a new image id, given a signup id and the image timestamp.
     #[must_use]
-    pub fn new(signup_id: &SignupId, timestamp: Duration) -> Self {
-        let r: u32 = thread_rng().gen();
-        let t_least_sig_bytes = &timestamp.as_nanos().to_le_bytes()[0..4];
-        let t = u32::from_le_bytes(t_least_sig_bytes.try_into().unwrap());
+    pub fn new(signup_id: &SignupId, hash: u32) -> Self {
         let mut new_id = signup_id.0.clone();
-        new_id.data_id = r ^ t;
+        new_id.data_id = hash;
         Self(new_id)
     }
 
@@ -126,13 +123,11 @@ impl FromStr for ImageId {
 mod tests {
     use super::*;
     use eyre::Result;
-    use std::time::SystemTime;
 
     #[test]
     fn test_object_id() -> Result<()> {
-        let start = SystemTime::now();
         let signup_id = SignupId::new(S3Region::Unknown);
-        let image_id = ImageId::new(&signup_id, SystemTime::now().duration_since(start)?);
+        let image_id = ImageId::new(&signup_id, 123_123);
         let s = image_id.to_string();
         assert_eq!(s.parse::<WldDataId>()?.to_string(), s);
         Ok(())
@@ -141,14 +136,9 @@ mod tests {
     #[test]
     fn test_sensitivity() {
         let signup_id = SignupId::new(S3Region::Unknown);
-        let t1 = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .expect("system time must be after UNIX EPOCH");
-        let t2 = t1 + Duration::from_nanos(1);
-
         assert_ne!(
-            ImageId::new(&signup_id, t1).to_string(),
-            ImageId::new(&signup_id, t2).to_string()
+            ImageId::new(&signup_id, 0).to_string(),
+            ImageId::new(&signup_id, 1).to_string()
         );
     }
 }

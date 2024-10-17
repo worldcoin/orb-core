@@ -3,14 +3,15 @@
 pub mod mecard;
 
 use self::mecard::{AuthType, Credentials};
-use crate::monitor::net::ping;
+use crate::{backend::endpoints::NETWORK_MONITOR_HOST, monitor::net::ping, process::Command};
 use data_encoding::HEXLOWER;
 use eyre::{eyre, Result, WrapErr};
 use ring::{pbkdf2, pbkdf2::PBKDF2_HMAC_SHA1};
-use std::{num::NonZeroU32, process::Command, str};
+use std::{num::NonZeroU32, str};
 use tokio::task::spawn_blocking;
 
-const WPA_SUPPLICANT_INTERFACE_BIN: &str = "/usr/local/bin/wpa-supplicant-interface";
+/// Absolute path to wpa-supplicant-interface
+pub const WPA_SUPPLICANT_INTERFACE_BIN: &str = "/usr/local/bin/wpa-supplicant-interface";
 
 /// Network connection status.
 #[derive(Debug, Clone, Copy)]
@@ -30,7 +31,7 @@ pub enum Status {
 /// network. The internet connection is not checked.
 pub async fn status() -> Result<Status> {
     spawn_blocking(|| {
-        if ping().is_some() {
+        if ping(&NETWORK_MONITOR_HOST).is_ok() {
             tracing::info!("Found working connection to the backend. Skipping WiFi status check.");
             return Ok(Status::Connected { has_internet: true });
         }
@@ -50,7 +51,7 @@ pub async fn status() -> Result<Status> {
                     if unsafe { libc::res_init() } != 0 {
                         tracing::error!("Failed to re-initialize DNS resolver");
                     }
-                    let has_internet = ping().is_some();
+                    let has_internet = ping(&NETWORK_MONITOR_HOST).is_ok();
                     Ok(Status::Connected { has_internet })
                 }
                 "DISCONNECTED" | "INACTIVE" | "INTERFACE_DISABLED" => Ok(Status::Disconnected),
@@ -76,13 +77,12 @@ pub async fn join(credentials: Credentials) -> Result<()> {
         let mut cmd = Command::new(WPA_SUPPLICANT_INTERFACE_BIN);
         cmd.arg("join");
         match credentials.auth_type {
-            AuthType::Wep => {
+            AuthType::Wep | AuthType::Nopass => {
                 cmd.arg("--auth").arg("NONE");
             }
             AuthType::Wpa | AuthType::Sae => {
                 cmd.arg("--auth").arg("WPA-PSK");
             }
-            AuthType::Nopass => {}
         }
         cmd.arg("--ssid").arg(hex_string(credentials.ssid.as_bytes()));
         if let Some(password) = &credentials.password {

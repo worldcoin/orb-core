@@ -15,17 +15,19 @@ use crate::{
     agents::{
         camera,
         python::{face_identifier, iris, rgb_net, AgentPython},
-        Agent,
+        ProcessInitializer,
     },
     config::Config,
     consts::{RGB_NATIVE_HEIGHT, RGB_NATIVE_WIDTH},
-    inst_elapsed,
-    logger::{LogOnError, DATADOG, NO_TAGS},
-    port::{Port, SharedPort},
+    dd_timing,
 };
-use eyre::Result;
+use agentwire::{
+    agent::{self, Agent as _},
+    port::{self, Port, SharedPort},
+};
+use ai_interface::PyError;
+use eyre::{Error, Result};
 use pyo3::{PyErr, Python};
-use python_agent_interface::PyError;
 use rkyv::{Archive, Deserialize, Serialize};
 use schemars::JsonSchema;
 use serde::Serialize as SerdeSerialize;
@@ -44,7 +46,7 @@ pub struct MegaAgentTwo {
     pub iris: iris::Model,
 }
 
-impl super::Agent for MegaAgentTwo {
+impl agentwire::Agent for MegaAgentTwo {
     const NAME: &'static str = "mega-agent-two";
 }
 
@@ -76,7 +78,7 @@ pub enum Output {
     /// Output for the RGB-Net model.
     RgbNet(rgb_net::Output),
     /// Output for the Iris model.
-    Iris(iris::Output),
+    Iris(Box<iris::Output>),
     /// Output for the RGB-Net and the Face Identifier model.
     FusionRgbNetFaceIdentifier {
         /// Output for the RGB-Net model.
@@ -106,10 +108,11 @@ impl Port for MegaAgentTwo {
 }
 
 impl SharedPort for MegaAgentTwo {
-    const SERIALIZED_CONFIG_EXTRA_SIZE: usize =
-        <face_identifier::Model as SharedPort>::SERIALIZED_CONFIG_EXTRA_SIZE
-            + <rgb_net::Model as SharedPort>::SERIALIZED_CONFIG_EXTRA_SIZE
-            + <iris::Model as SharedPort>::SERIALIZED_CONFIG_EXTRA_SIZE;
+    const SERIALIZED_INIT_SIZE: usize = size_of::<usize>()
+        + size_of::<<MegaAgentTwo as Archive>::Archived>()
+        + <face_identifier::Model as SharedPort>::SERIALIZED_INIT_SIZE
+        + <rgb_net::Model as SharedPort>::SERIALIZED_INIT_SIZE
+        + <iris::Model as SharedPort>::SERIALIZED_INIT_SIZE;
     const SERIALIZED_INPUT_SIZE: usize = size_of::<<Input as Archive>::Archived>()
         + (RGB_NATIVE_HEIGHT as usize * RGB_NATIVE_WIDTH as usize * 3) * 4;
     const SERIALIZED_OUTPUT_SIZE: usize = size_of::<<Output as Archive>::Archived>()
@@ -154,25 +157,19 @@ impl super::Environment<MegaAgentTwo> for Environment<'_> {
                 });
 
                 let op = "fusion_rgbnet_faceidentifier";
-                DATADOG
-                    .timing(
-                        format!("orb.main.time.processing.{}.{}", MegaAgentTwo::DD_NS, op),
-                        inst_elapsed!(t),
-                        NO_TAGS,
-                    )
-                    .or_log();
+                dd_timing!("main.time.processing" + format!("{}.{}", MegaAgentTwo::DD_NS, op), t);
                 tracing::info!(
                     "Python agent {}::{} <benchmark>: {} ms",
                     MegaAgentTwo::NAME,
                     op,
-                    inst_elapsed!(t)
+                    t.elapsed().as_millis()
                 );
 
                 res
             }
             ArchivedInput::Iris(input) => {
                 tracing::debug!("{}: Received input for Iris", MegaAgentTwo::NAME);
-                Ok(Output::Iris(self.iris_env.iterate(py, input)?))
+                Ok(Output::Iris(Box::new(self.iris_env.iterate(py, input)?)))
             }
             ArchivedInput::Config => {
                 tracing::debug!("{}: Received input for Config", MegaAgentTwo::NAME);
@@ -229,7 +226,7 @@ impl super::AgentPython for MegaAgentTwo {
         tracing::info!(
             "Python agent {} <benchmark>: initialization done in {} ms",
             MegaAgentTwo::NAME,
-            inst_elapsed!(t)
+            t.elapsed().as_millis()
         );
 
         Ok(Box::new(Environment {
@@ -238,6 +235,18 @@ impl super::AgentPython for MegaAgentTwo {
             iris_env,
             config: config_clone,
         }))
+    }
+}
+
+impl agentwire::agent::Process for MegaAgentTwo {
+    type Error = Error;
+
+    fn run(self, port: port::RemoteInner<Self>) -> Result<(), Self::Error> {
+        self.run_python_process(port)
+    }
+
+    fn initializer() -> impl agent::process::Initializer {
+        ProcessInitializer::default()
     }
 }
 

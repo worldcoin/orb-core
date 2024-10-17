@@ -8,7 +8,7 @@ use nom::{
     bytes::complete::tag,
     character::complete::anychar,
     combinator::{eof, fail, map, opt, verify},
-    multi::fold_many1,
+    multi::fold_many0,
     sequence::pair,
     IResult,
 };
@@ -106,7 +106,12 @@ impl Credentials {
             parse_password => password,
             parse_hidden => hidden,
         }
-        let password = password.map(Password);
+
+        let ssid = ssid.filter(|ssid| !ssid.is_empty());
+        let (password, auth_type) = password
+            .filter(|pwd| !pwd.is_empty())
+            .map_or((None, Some(AuthType::Nopass)), |pwd| (Some(Password(pwd)), auth_type));
+
         // ssid is actually not optional.
         if ssid.is_none() {
             let (_, ()) = fail(input)?;
@@ -128,7 +133,7 @@ impl AuthType {
             let wep = map(tag("WEP"), |_| Self::Wep);
             let wpa = map(tag("WPA"), |_| Self::Wpa);
             let sae = map(tag("SAE"), |_| Self::Sae);
-            let nopass = map(tag("nopass"), |_| Self::Nopass);
+            let nopass = map(alt((tag("nopass"), tag(""))), |_| Self::Nopass);
             alt((wep, wpa, sae, nopass))(input)
         })
     }
@@ -145,7 +150,7 @@ fn parse_password(input: &str) -> IResult<&str, String> {
 fn parse_hidden(input: &str) -> IResult<&str, bool> {
     parse_field(input, "H", |input| {
         let true_val = map(tag("true"), |_| true);
-        let false_val = map(tag("false"), |_| false);
+        let false_val = map(alt((tag("false"), tag(""))), |_| false);
         alt((true_val, false_val))(input)
     })
 }
@@ -156,7 +161,7 @@ fn parse_string(input: &str) -> IResult<&str, String> {
     let special = pair(tag("\\"), verify(anychar, |c| SPECIAL_CHARS.iter().any(|s| c == s)));
     let unescaped = alt((non_special, map(special, |(_, c)| c)));
     let (input, quote) = opt(tag("\""))(input)?;
-    let (input, string) = fold_many1(unescaped, String::new, |mut acc, item| {
+    let (input, string) = fold_many0(unescaped, String::new, |mut acc, item| {
         acc.push(item);
         acc
     })(input)?;
@@ -249,6 +254,9 @@ mod tests {
     fn test_missing_ssid() {
         let input = "WIFI:P:mypass;T:WPA;H:true;;";
         assert!(Credentials::parse(input).is_err());
+
+        let input = "WIFI:P:mypass;S:;T:WPA;H:true;;";
+        assert!(Credentials::parse(input).is_err());
     }
 
     #[test]
@@ -270,6 +278,37 @@ mod tests {
         assert_eq!(credentials.auth_type, AuthType::Nopass);
         assert_eq!(credentials.ssid, "worldcoin");
         assert_eq!(credentials.password, None);
+        assert!(!credentials.hidden);
+    }
+
+    #[test]
+    fn test_empty_password() {
+        let input = r"WIFI:S:hotspotname;T:nopass;P:;H:false;;";
+        let (_, credentials) = Credentials::parse(input).unwrap();
+        assert_eq!(credentials.ssid, "hotspotname");
+        assert_eq!(credentials.password, None);
+        assert_eq!(credentials.auth_type, AuthType::Nopass);
+
+        let input = r"WIFI:S:hotspotname;T:nopass;H:false;;";
+        let (_, credentials) = Credentials::parse(input).unwrap();
+        assert_eq!(credentials.ssid, "hotspotname");
+        assert_eq!(credentials.password, None);
+        assert_eq!(credentials.auth_type, AuthType::Nopass);
+
+        let input = r"WIFI:S:hotspotname;T:WPA;P:;;";
+        let (_, credentials) = Credentials::parse(input).unwrap();
+        assert_eq!(credentials.ssid, "hotspotname");
+        assert_eq!(credentials.password, None);
+        assert_eq!(credentials.auth_type, AuthType::Nopass);
+    }
+
+    #[test]
+    fn test_empty_tags() {
+        let input = r"WIFI:T:;S:hotspotname;P:;H:;;";
+        let (_, credentials) = Credentials::parse(input).unwrap();
+        assert_eq!(credentials.ssid, "hotspotname");
+        assert_eq!(credentials.password, None);
+        assert_eq!(credentials.auth_type, AuthType::Nopass);
         assert!(!credentials.hidden);
     }
 }

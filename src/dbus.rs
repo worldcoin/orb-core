@@ -53,3 +53,12 @@ pub trait Supervisor {
     #[dbus_proxy(name = "ScheduleShutdown")]
     fn schedule_shutdown(&self, kind: &str, when: u64) -> zbus::Result<()>;
 }
+
+#[dbus_proxy(
+    default_service = "org.worldcoin.OrbUiState1",
+    default_path = "/org/worldcoin/OrbUiState1",
+    interface = "org.worldcoin.OrbUiState1"
+)]
+pub trait SignupState {
+    fn orb_signup_state_event(&self, serialized_event: String) -> zbus::Result<()>;
+}

@@ -1,12 +1,10 @@
 use std::env;
 
-use eyre::{Context, Result};
-use orb::{backend::init_cert, config::Config};
+use eyre::Result;
+use orb::config::Config;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    init_cert().wrap_err("initializing root certificate")?;
-
     if env::var("ORB_ID").expect("ORB_ID environmental variable is missing").is_empty() {
         panic!("ORB_ID environmental variable is missing")
     }

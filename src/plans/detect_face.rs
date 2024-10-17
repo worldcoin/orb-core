@@ -2,10 +2,10 @@
 
 use crate::{
     agents::{camera, python},
-    brokers::{BrokerFlow, Orb, OrbPlan},
-    consts::{DETECT_FACE_TIMEOUT, RGB_REDUCED_HEIGHT, RGB_REDUCED_WIDTH},
-    port,
+    brokers::{Orb, OrbPlan},
+    consts::{RGB_FPS, RGB_REDUCED_HEIGHT, RGB_REDUCED_WIDTH},
 };
+use agentwire::{port, BrokerFlow};
 use eyre::Result;
 use futures::prelude::*;
 use std::{
@@ -52,14 +52,15 @@ impl OrbPlan for Plan {
 impl Plan {
     /// Creates a new face detection plan.
     #[must_use]
-    #[allow(clippy::new_without_default)]
-    pub fn new() -> Self {
-        Self { timeout: Box::pin(time::sleep(DETECT_FACE_TIMEOUT)), face_detected: false }
+    pub fn new(timeout: time::Duration) -> Self {
+        Self { timeout: Box::pin(time::sleep(timeout)), face_detected: false }
     }
+}
 
+impl Plan {
     /// Runs the face detection plan.
     pub async fn run(&mut self, orb: &mut Orb) -> Result<bool> {
-        orb.start_rgb_camera().await?;
+        orb.start_rgb_camera(RGB_FPS).await?;
         orb.enable_rgb_net(true).await?;
         orb.set_fisheye(RGB_REDUCED_WIDTH, RGB_REDUCED_HEIGHT, false).await?;
         orb.run(self).await?;

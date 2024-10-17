@@ -11,7 +11,6 @@ env:
 
 on:
   pull_request:
-  workflow_dispatch:
   push:
     branches:
       - main
@@ -20,17 +19,31 @@ on:
       - "*"
 
 jobs:
+  deny:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332 # pin@v4.1.7
+        with:
+          token: ${{ secrets.GIT_HUB_TOKEN }}
+      - uses: cachix/install-nix-action@ba0dd844c9180cbf77aa72a116d6fbc515d0e87b # pin@ v27
+        with:
+          github_access_token: ${{ secrets.GIT_HUB_TOKEN }}
+      - uses: cachix/cachix-action@ad2ddac53f961de1989924296a1f236fcfbaa4fc # pin@v15
+        with:
+          name: worldcoin
+          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+      - run: nix/cross.sh nix/ci.sh --server deny
+
   format:
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@f43a0e5ff2bd294095638e18286ca9a3d1956744 # pin@v3
+      - uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332 # pin@v4.1.7
         with:
           token: ${{ secrets.GIT_HUB_TOKEN }}
-      - uses: cachix/install-nix-action@6ed004b9ccb68dbc28e7c85bee15fa93dbd214ac # pin@v22
+      - uses: cachix/install-nix-action@ba0dd844c9180cbf77aa72a116d6fbc515d0e87b # pin@ v27
         with:
           github_access_token: ${{ secrets.GIT_HUB_TOKEN }}
-      - uses: cachix/cachix-action@6a9a34cdd93d0ae4b4b59fd678660efb08109f2f # pin@v12
-        continue-on-error: true
+      - uses: cachix/cachix-action@ad2ddac53f961de1989924296a1f236fcfbaa4fc # pin@v15
         with:
           name: worldcoin
           authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
@@ -39,14 +52,13 @@ jobs:
   clippy:
     runs-on: ubuntu-22.04-32core
     steps:
-      - uses: actions/checkout@f43a0e5ff2bd294095638e18286ca9a3d1956744 # pin@v3
+      - uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332 # pin@v4.1.7
         with:
           token: ${{ secrets.GIT_HUB_TOKEN }}
-      - uses: cachix/install-nix-action@6ed004b9ccb68dbc28e7c85bee15fa93dbd214ac # pin@v22
+      - uses: cachix/install-nix-action@ba0dd844c9180cbf77aa72a116d6fbc515d0e87b # pin@ v27
         with:
           github_access_token: ${{ secrets.GIT_HUB_TOKEN }}
-      - uses: cachix/cachix-action@6a9a34cdd93d0ae4b4b59fd678660efb08109f2f # pin@v12
-        continue-on-error: true
+      - uses: cachix/cachix-action@ad2ddac53f961de1989924296a1f236fcfbaa4fc # pin@v15
         with:
           name: worldcoin
           authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
@@ -56,53 +68,57 @@ jobs:
           git add git_version
       - run: nix/cross.sh nix/ci.sh --server clippy
 
-  # check_debug_report_version:
-  #   runs-on: ubuntu-22.04-32core
-  #   environment: release
-  #   permissions:
-  #     id-token: write
-  #     contents: read
-  #   steps:
-  #     - uses: actions/checkout@f43a0e5ff2bd294095638e18286ca9a3d1956744 # pin@v3
-  #       with:
-  #         token: ${{ secrets.GIT_HUB_TOKEN }}
-  #     - uses: cachix/install-nix-action@6ed004b9ccb68dbc28e7c85bee15fa93dbd214ac # pin@v22
-  #       with:
-  #         github_access_token: ${{ secrets.GIT_HUB_TOKEN }}
-  #     - uses: cachix/cachix-action@6a9a34cdd93d0ae4b4b59fd678660efb08109f2f # pin@v12
-  #       continue-on-error: true
-  #       with:
-  #         name: worldcoin
-  #         authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
-  #     - name: Configure AWS Credentials
-  #       uses: aws-actions/configure-aws-credentials@5fd3084fc36e372ff1fff382a39b10d03659f355 # pin@v2
-  #       with:
-  #         aws-region: eu-central-1
-  #         role-to-assume: ${{ secrets.INTERNAL_TOOLS_AWS_ROLE }}
-  #     - name: Check Signup Data Version and export schema
-  #       run: nix/native.sh nix/ci.sh --server check_debug_report_version
-  #     - name: Copy artifacts due to https://github.com/actions/upload-artifact/issues/92
-  #       run: cp -rL result artifacts
-  #     - name: Upload CSV & JSON files as artifacts
-  #       if: ${{ github.ref_name == 'main' || github.ref_name == 'prod' }}
-  #       uses: actions/upload-artifact@a8a3f3ad30e3422c9c7b888a15615d19a852ae32 # pin@v3
-  #       with:
-  #         name: debug-report-schema
-  #         path: |
-  #           artifacts/debug_report_schema.csv
-  #           artifacts/debug_report_schema.json
+  check_debug_report_version:
+    runs-on: ubuntu-22.04-32core
+    environment: release
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332 # pin@v4.1.7
+        with:
+          token: ${{ secrets.GIT_HUB_TOKEN }}
+      - uses: cachix/install-nix-action@ba0dd844c9180cbf77aa72a116d6fbc515d0e87b # pin@ v27
+        with:
+          github_access_token: ${{ secrets.GIT_HUB_TOKEN }}
+      - uses: cachix/cachix-action@ad2ddac53f961de1989924296a1f236fcfbaa4fc # pin@v15
+        with:
+          name: worldcoin
+          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502 # pin@v4.0.2
+        with:
+          aws-region: eu-central-1
+          role-to-assume: ${{ secrets.INTERNAL_TOOLS_AWS_ROLE }}
+      - name: Check Debug Report Version and export schema
+        run: nix/native.sh nix/ci.sh --server check_debug_report_version
+      - name: Copy artifacts due to https://github.com/actions/upload-artifact/issues/92
+        run: cp -rL result artifacts
+      - name: Upload CSV & JSON files as artifacts
+        if: ${{ github.ref_name == 'main' || github.ref_name == 'prod' }}
+        uses: actions/upload-artifact@50769540e7f4bd5e21e526ee35c689e35e0d6874 # pin@v4.4.0
+        with:
+          name: debug-report-schema
+          path: |
+            artifacts/debug_report_schema.csv
+            artifacts/debug_report_schema.json
+      - name: Upload CSV & JSON files on AWS S3
+        if: ${{ github.ref_name == 'main' || github.ref_name == 'prod' }}
+        run: |
+          zip -j debug_report_schema.zip artifacts/debug_report_schema.csv artifacts/debug_report_schema.json
+          FILENAME=$(echo debug_report_schema_$(date -u +"%Y-%m-%d")_$GITHUB_SHA.zip)
+          aws s3 cp --only-show-errors debug_report_schema.zip s3://wld-signup-data-schema/$FILENAME
 
   test:
     runs-on: ubuntu-22.04-32core
     steps:
-      - uses: actions/checkout@f43a0e5ff2bd294095638e18286ca9a3d1956744 # pin@v3
+      - uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332 # pin@v4.1.7
         with:
           token: ${{ secrets.GIT_HUB_TOKEN }}
-      - uses: cachix/install-nix-action@6ed004b9ccb68dbc28e7c85bee15fa93dbd214ac # pin@v22
+      - uses: cachix/install-nix-action@ba0dd844c9180cbf77aa72a116d6fbc515d0e87b # pin@ v27
         with:
           github_access_token: ${{ secrets.GIT_HUB_TOKEN }}
-      - uses: cachix/cachix-action@6a9a34cdd93d0ae4b4b59fd678660efb08109f2f # pin@v12
-        continue-on-error: true
+      - uses: cachix/cachix-action@ad2ddac53f961de1989924296a1f236fcfbaa4fc # pin@v15
         with:
           name: worldcoin
           authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
@@ -113,16 +129,15 @@ jobs:
       - run: nix/native.sh nix/ci.sh --server test
 
   doc:
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-22.04-32core
     steps:
-      - uses: actions/checkout@f43a0e5ff2bd294095638e18286ca9a3d1956744 # pin@v3
+      - uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332 # pin@v4.1.7
         with:
           token: ${{ secrets.GIT_HUB_TOKEN }}
-      - uses: cachix/install-nix-action@6ed004b9ccb68dbc28e7c85bee15fa93dbd214ac # pin@v22
+      - uses: cachix/install-nix-action@ba0dd844c9180cbf77aa72a116d6fbc515d0e87b # pin@ v27
         with:
           github_access_token: ${{ secrets.GIT_HUB_TOKEN }}
-      - uses: cachix/cachix-action@6a9a34cdd93d0ae4b4b59fd678660efb08109f2f # pin@v12
-        continue-on-error: true
+      - uses: cachix/cachix-action@ad2ddac53f961de1989924296a1f236fcfbaa4fc # pin@v15
         with:
           name: worldcoin
           authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
@@ -133,18 +148,17 @@ jobs:
       - run: nix/native.sh nix/ci.sh --server doc
 
   build:
-    if: ${{ github.ref_name == 'master' || github.ref_name == 'prod' || (github.ref_type == 'tag' && startsWith(github.ref_name, 'v')) }}
+    if: ${{ github.ref_name == 'main' || github.ref_name == 'prod' || (github.ref_type == 'tag' && startsWith(github.ref_name, 'v')) }}
     runs-on: ubuntu-22.04-32core
-    needs: [ format, clippy, test, doc ]
+    needs: [ format, clippy, test, doc, check_debug_report_version ]
     steps:
-      - uses: actions/checkout@f43a0e5ff2bd294095638e18286ca9a3d1956744 # pin@v3
+      - uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332 # pin@v4.1.7
         with:
           token: ${{ secrets.GIT_HUB_TOKEN }}
-      - uses: cachix/install-nix-action@6ed004b9ccb68dbc28e7c85bee15fa93dbd214ac # pin@v22
+      - uses: cachix/install-nix-action@ba0dd844c9180cbf77aa72a116d6fbc515d0e87b # pin@ v27
         with:
           github_access_token: ${{ secrets.GIT_HUB_TOKEN }}
-      - uses: cachix/cachix-action@6a9a34cdd93d0ae4b4b59fd678660efb08109f2f # pin@v12
-        continue-on-error: true
+      - uses: cachix/cachix-action@ad2ddac53f961de1989924296a1f236fcfbaa4fc # pin@v15
         with:
           name: worldcoin
           authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
@@ -153,17 +167,21 @@ jobs:
           git describe --always > git_version
           git add git_version
       - name: Build release binaries
-        run: nix/cross.sh nix/ci.sh --server build
+        run: |
+          nix/cross.sh nix/ci.sh --server build
+          mkdir -p artifacts
+          cp -rL result/* artifacts/
+          nix/cross.sh nix/ci.sh --server build_livestream_client
+          cp -rL result/* artifacts/
       - name: Archive artifacts due to https://github.com/actions/upload-artifact/issues/92
         run: |
-          cp -rL result artifacts
           tar -czvhf orb-core-artifacts.tar.gz artifacts
-      - uses: actions/upload-artifact@a8a3f3ad30e3422c9c7b888a15615d19a852ae32 # pin@v3
+      - uses: actions/upload-artifact@50769540e7f4bd5e21e526ee35c689e35e0d6874 # pin@v4.4.0
         with:
           name: orb-core-artifacts
           path: artifacts
       - name: Upload Release
-        uses: softprops/action-gh-release@de2c0eb89ae2a093876385947365aca7b0e5f844 # pin@v1
+        uses: softprops/action-gh-release@c062e08bd532815e2082a85e87e3ef29c3e6d191 # pin@v2.0.8
         # only run this for release tags (e.g. v1.1.0)
         if: ${{ github.ref_type == 'tag' && startsWith(github.ref_name, 'v') }}
         with:
@@ -171,8 +189,8 @@ jobs:
           files: |
             orb-core-artifacts.tar.gz
       - name: Upload Development Build
-        # only run this for master branch
-        if: ${{ github.ref_name == 'master' }}
+        # only run this for main branch
+        if: ${{ github.ref_name == 'main' }}
         run: |
           gh release delete latest \
             --yes \
@@ -180,7 +198,7 @@ jobs:
             --repo ${{ github.repository }} || true
           gh release create latest \
             --title 'Development Build' \
-            --notes 'Latest successful build of master' \
+            --notes 'Latest successful build of main' \
             --prerelease \
             --repo ${{ github.repository }} \
             orb-core-artifacts.tar.gz

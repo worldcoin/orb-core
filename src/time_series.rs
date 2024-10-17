@@ -1,18 +1,17 @@
 //! Generic time-series list.
 
 use crate::timestamped::Timestamped;
+#[cfg(test)]
+use mock_instant::Instant;
 use serde::{Serialize, Serializer};
+#[cfg(not(test))]
+use std::time::Instant;
 use std::{
     collections::vec_deque::{Iter, VecDeque},
     iter::{DoubleEndedIterator, ExactSizeIterator, FusedIterator},
     marker::PhantomData,
     time::Duration,
 };
-
-#[cfg(test)]
-use mock_instant::Instant;
-#[cfg(not(test))]
-use std::time::Instant;
 
 /// Generic time-series list.
 ///
@@ -90,8 +89,7 @@ impl<T> TimeSeries<T> {
     /// Returns an iterator over the values.
     pub fn values(
         &mut self,
-    ) -> impl Iterator<Item = &T> + DoubleEndedIterator + FusedIterator + ExactSizeIterator + '_
-    {
+    ) -> impl DoubleEndedIterator<Item = &T> + FusedIterator + ExactSizeIterator + '_ {
         self.iter().map(|timestamped| &timestamped.value)
     }
 

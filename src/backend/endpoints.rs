@@ -35,6 +35,9 @@ make_urls! {
     /// Signup backend URL.
     pub static SIGNUP_BACKEND_URL="https://signup.{}.worldcoin.org";
 
+    /// Relay backend URL.
+    pub static RELAY_BACKEND_URL="https://relay.{}.worldcoin.org";
+
     /// Host for network monitoring purposes.
     pub static NETWORK_MONITOR_HOST="signup.{}.worldcoin.org";
 }

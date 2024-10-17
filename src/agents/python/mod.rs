@@ -1,10 +1,9 @@
 //! Python-based agents.
 
-use super::{Agent, AgentProcess};
-use crate::{
-    logger::DATADOG,
+use crate::{dd_incr, utils::RkyvNdarray};
+use agentwire::{
+    agent,
     port::{self, SharedPort, SharedSerializer},
-    utils::RkyvNdarray,
 };
 use eyre::{Report, Result, WrapErr};
 use ndarray::{Ix1, Ix2};
@@ -19,6 +18,7 @@ pub mod ir_net;
 pub mod iris;
 pub mod mega_agent_one;
 pub mod mega_agent_two;
+pub mod occlusion;
 pub mod rgb_net;
 
 // TODO(andronat): These marcos should go to all agents.
@@ -97,9 +97,9 @@ fn check_model_version(module: &PyModule, min_version: &str) -> Result<String> {
 /// Python-based agent.
 ///
 /// NOTE: When implementing this trait, add a new match arm to the
-/// [`crate::agents::agent_process_map`].
+/// [`crate::agents::call_process_agent`].
 #[allow(clippy::module_name_repetitions)] // for consistency with other agent traits
-pub trait AgentPython: AgentProcess + SharedPort
+pub trait AgentPython: agent::Process + SharedPort
 where
     <Self as Archive>::Archived: Deserialize<Self, Infallible>,
     Self::Input: Archive + for<'a> Serialize<SharedSerializer<'a>>,
@@ -125,45 +125,24 @@ where
         let s = pyerr.get_type(py).to_string();
         let sanitized_err_type = re.replace_all(&s, "_");
 
-        DATADOG
-            .incr(format!("orb.main.count.neural_network.{}.python_exception.type", Self::DD_NS), [
-                format!("type:{sanitized_err_type}"),
-            ])
-            .unwrap_or_else(|e| tracing::error!("Datadog error in agent {}: {e:#?}", Self::NAME));
+        dd_incr!(
+            "main.count.neural_network" + format!("{}.python_exception.type", Self::DD_NS),
+            &format!("type:{sanitized_err_type}")
+        );
     }
-}
 
-/// Python environment.
-pub trait Environment<T: SharedPort>
-where
-    T::Input: Archive + for<'a> Serialize<SharedSerializer<'a>>,
-    T::Output: Archive + for<'a> Serialize<SharedSerializer<'a>>,
-    <T::Output as Archive>::Archived: Deserialize<T::Output, SharedDeserializeMap>,
-{
-    /// This method is called continuously by the main loop.
-    fn iterate(&mut self, py: Python, input: &<T::Input as Archive>::Archived)
-    -> Result<T::Output>;
-}
-
-impl<T: AgentPython> AgentProcess for T
-where
-    <T as Archive>::Archived: Deserialize<T, Infallible>,
-    T::Input: Archive + for<'a> Serialize<SharedSerializer<'a>>,
-    T::Output: Archive + for<'a> Serialize<SharedSerializer<'a>>,
-    <T::Output as Archive>::Archived: Deserialize<T::Output, SharedDeserializeMap>,
-{
-    fn run(self, mut port: port::RemoteInner<Self>) -> Result<()> {
+    /// Runs the agent in a separate process.
+    fn run_python_process(self, mut port: port::RemoteInner<Self>) -> Result<()> {
         Python::with_gil(|py| {
             init_sys_argv(py);
             tracing::info!("Python agent '{}': initializing", Self::NAME);
             let mut environment = self
                 .init(py)
-                .map_err(|err| {
+                .inspect_err(|err| {
                     if let Some(err) = err.downcast_ref::<PyErr>() {
                         tracing::info!("Python agent '{}' python exception: {err:#?}", Self::NAME);
                         err.print(py);
                     }
-                    err
                 })
                 .wrap_err("python agent initialization")?;
             tracing::info!("Python agent '{}': environment loaded successfully", Self::NAME);
@@ -177,7 +156,7 @@ where
 
                 match environment.iterate(py, input.value) {
                     Ok(output) => {
-                        port.send(chain(output));
+                        port.send(&chain(output));
                     }
                     Err(err) => {
                         tracing::warn!("Python agent '{}' error: {err:#?}", Self::NAME);
@@ -190,6 +169,18 @@ where
             }
         })
     }
+}
+
+/// Python environment.
+pub trait Environment<T: SharedPort>
+where
+    T::Input: Archive + for<'a> Serialize<SharedSerializer<'a>>,
+    T::Output: Archive + for<'a> Serialize<SharedSerializer<'a>>,
+    <T::Output as Archive>::Archived: Deserialize<T::Output, SharedDeserializeMap>,
+{
+    /// This method is called continuously by the main loop.
+    fn iterate(&mut self, py: Python, input: &<T::Input as Archive>::Archived)
+    -> Result<T::Output>;
 }
 
 /// hack to fix module 'sys' has no attribute 'argv' error
@@ -219,14 +210,15 @@ fn extract_normalized_mask(obj: &PyAny) -> PyResult<RkyvNdarray<bool, Ix2>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::port::Port;
+    use agentwire::{port::Port, Agent as _};
+    use eyre::Error;
     use pyo3::types::PyDict;
     use std::collections::HashMap;
 
     #[derive(Clone, Debug, Archive, Serialize, Deserialize)]
     struct Model {}
     impl SharedPort for Model {
-        const SERIALIZED_CONFIG_EXTRA_SIZE: usize = 0;
+        const SERIALIZED_INIT_SIZE: usize = 0;
         const SERIALIZED_INPUT_SIZE: usize = 0;
         const SERIALIZED_OUTPUT_SIZE: usize = 0;
     }
@@ -237,7 +229,7 @@ mod tests {
         const INPUT_CAPACITY: usize = 0;
         const OUTPUT_CAPACITY: usize = 0;
     }
-    impl super::Agent for Model {
+    impl agentwire::Agent for Model {
         const NAME: &'static str = "test";
     }
     impl AgentPython for Model {
@@ -246,6 +238,13 @@ mod tests {
 
         fn init<'py>(self, _py: Python<'py>) -> Result<Box<dyn super::Environment<Self> + 'py>> {
             unreachable!()
+        }
+    }
+    impl agentwire::agent::Process for Model {
+        type Error = Error;
+
+        fn run(self, port: port::RemoteInner<Self>) -> Result<(), Self::Error> {
+            self.run_python_process(port)
         }
     }
 

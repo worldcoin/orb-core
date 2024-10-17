@@ -2,19 +2,17 @@
 
 use crate::{
     agents::{mirror, python},
-    logger::DATADOG,
+    dd_gauge,
     pid::{InstantTimer, Pid, Timer},
-    port,
-    port::Port,
     utils::RkyvNdarray,
 };
-use async_trait::async_trait;
-use eyre::Result;
+use agentwire::port::{self, Port};
+use eyre::{Error, Result};
 use futures::prelude::*;
 use ndarray::prelude::*;
 use std::time::Duration;
 
-const IRIS_DIAMETER: f64 = 12.0; // in mm
+const IRIS_DIAMETER_MM: f64 = 12.0;
 
 // If there are no landmarks from IRNet after certain amount of time, reset the
 // offset.
@@ -24,9 +22,9 @@ const RESET_DELAY: Duration = Duration::from_millis(1800);
 const TRUSTED_RADIUS: f64 = 100.0;
 
 // PID parameters.
-const PID_PROPORTIONAL: f64 = 0.004;
+const PID_PROPORTIONAL: f64 = 0.012;
 const PID_INTEGRAL: f64 = 0.00016;
-const PID_DERIVATIVE: f64 = 0.0008;
+const PID_DERIVATIVE: f64 = 0.0023;
 const PID_FILTER: f64 = 0.26;
 
 // Interval during which to suppress the PID, because of the mirror is switching
@@ -58,13 +56,14 @@ impl Port for Agent {
     const OUTPUT_CAPACITY: usize = 0;
 }
 
-impl super::Agent for Agent {
+impl agentwire::Agent for Agent {
     const NAME: &'static str = "eye-pid-controller";
 }
 
-#[async_trait]
-impl super::AgentTask for Agent {
-    async fn run(self, mut port: port::Inner<Self>) -> Result<()> {
+impl agentwire::agent::Task for Agent {
+    type Error = Error;
+
+    async fn run(self, mut port: port::Inner<Self>) -> Result<(), Self::Error> {
         'reset: loop {
             let mut timer = InstantTimer::default();
             let mut controller = EyeOffsetController::new(RESET_DELAY.as_secs_f64());
@@ -89,13 +88,17 @@ impl super::AgentTask for Agent {
                         } else {
                             controller.idle(dt)
                         };
-                        DATADOG.gauge("orb.main.gauge.signup.pid.continuous", x.to_string(), [
-                            "type:horizontal",
-                        ])?;
-                        DATADOG.gauge("orb.main.gauge.signup.pid.continuous", y.to_string(), [
-                            "type:vertical",
-                        ])?;
-                        port.send(input.chain(mirror::Point { horizontal: x, vertical: y }))
+                        dd_gauge!(
+                            "main.gauge.signup.pid.continuous",
+                            x.to_string(),
+                            "type:phi_degrees"
+                        );
+                        dd_gauge!(
+                            "main.gauge.signup.pid.continuous",
+                            y.to_string(),
+                            "type:theta_degrees"
+                        );
+                        port.send(input.chain(mirror::Point { phi_degrees: x, theta_degrees: y }))
                             .await?;
                     }
                     Input::SwitchEye => {
@@ -142,8 +145,8 @@ impl EyeOffsetController {
     pub fn update(&mut self, x: f64, y: f64, dt: f64) -> (f64, f64) {
         self.idle_time = 0.0;
         let (curr_x, curr_y) = &mut self.curr;
-        *curr_x -= self.horizontal.advance(0.0, x, dt);
-        *curr_y += self.vertical.advance(0.0, y, dt);
+        *curr_x += self.horizontal.advance(0.0, x, dt);
+        *curr_y -= self.vertical.advance(0.0, y, dt);
         self.curr
     }
 
@@ -163,7 +166,7 @@ impl EyeOffsetController {
 
 fn iris_center_from_landmarks(landmarks: ArrayView2<f32>) -> Option<(f64, f64)> {
     let iris_width =
-        IRIS_DIAMETER / f64::from((landmarks.get((4, 0))? - landmarks.get((6, 0))?).abs());
+        IRIS_DIAMETER_MM / f64::from((landmarks.get((4, 0))? - landmarks.get((6, 0))?).abs());
     let center = landmarks.slice(s![4..8, ..]).mean_axis(Axis(0))?;
     let center_x = (f64::from(*center.get(0)?) - 0.5) * iris_width;
     let center_y = (f64::from(*center.get(1)?) - 0.5) * iris_width;

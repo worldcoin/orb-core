@@ -1,15 +1,22 @@
 //! QR-code scanning.
 
+pub mod operator;
+pub mod user;
+pub mod wifi;
+
 use crate::{
     agents::{camera, qr_code},
-    brokers::{BrokerFlow, Orb, OrbPlan},
-    consts::{QR_SCAN_REMINDER, RGB_DEFAULT_HEIGHT, RGB_DEFAULT_WIDTH},
-    ext::{broadcast::ReceiverExt, mpsc::SenderExt},
-    led, mcu, port, sound,
+    brokers::{Orb, OrbPlan},
+    consts::{QR_SCAN_REMINDER, RGB_DEFAULT_HEIGHT, RGB_DEFAULT_WIDTH, RGB_FPS, RGB_FPS_REDUCED},
+    ext::{broadcast::ReceiverExt as _, mpsc::SenderExt as _},
+    mcu, ui,
+    ui::QrScanSchema,
 };
+use agentwire::{port, BrokerFlow};
 use eyre::Result;
 use futures::prelude::*;
 use std::{
+    mem::replace,
     pin::Pin,
     task::{Context, Poll},
     time::Duration,
@@ -17,17 +24,10 @@ use std::{
 use tokio::time;
 use tokio_stream::wrappers::IntervalStream;
 
-pub mod operator;
-pub mod user;
-pub mod wifi;
-
 /// QR-code scanning schema.
 pub trait Schema: Send + Sized {
-    /// Returns the sound to tell the user which kind of QR-code is expected.
-    fn sound() -> sound::Type;
-
     /// Returns the LED schema to show during the scanning.
-    fn led() -> led::QrScanSchema;
+    fn ui() -> ui::QrScanSchema;
 
     /// Tries to parse the QR-code value. Returns `None` if the value doesn't
     /// match the schema.
@@ -38,8 +38,10 @@ pub trait Schema: Send + Sized {
 pub struct Plan<S: Schema> {
     reminder: Option<IntervalStream>,
     timeout: Option<Pin<Box<time::Sleep>>>,
-    qr_code: Result<S, ScanError>,
+    fps: u32,
+    qr_code: Result<(S, String), ScanError>,
     ux_started: bool,
+    self_serve: bool,
 }
 
 /// Error returned by the qr-code scannin plan.
@@ -54,18 +56,20 @@ pub enum ScanError {
 impl<S: Schema> OrbPlan for Plan<S> {
     fn handle_qr_code(
         &mut self,
-        _orb: &mut Orb,
+        orb: &mut Orb,
         output: port::Output<qr_code::Agent>,
     ) -> Result<BrokerFlow> {
         let qr_code = output.value.payload;
-        self.qr_code = S::try_parse(&qr_code).ok_or(ScanError::Invalid);
         // The underlying library sometimes detects ghost QR codes of a few characters. This
         // prevents a voice to be played in those cases.
-        if qr_code.len() > 10 {
-            return Ok(BrokerFlow::Break);
+        if qr_code.len() <= 10 {
+            tracing::warn!("Small, potentially ghost, QR code detected, skipping: {qr_code:?}");
+            return Ok(BrokerFlow::Continue);
         }
-        tracing::warn!("Small, potentially ghost, QR code detected, skipping: {:?}", qr_code);
-        Ok(BrokerFlow::Continue)
+        orb.ui.qr_scan_capture();
+        self.qr_code =
+            S::try_parse(&qr_code).map(|parsed| (parsed, qr_code)).ok_or(ScanError::Invalid);
+        Ok(BrokerFlow::Break)
     }
 
     fn handle_rgb_camera(
@@ -75,7 +79,7 @@ impl<S: Schema> OrbPlan for Plan<S> {
     ) -> Result<BrokerFlow> {
         // Ensure RGB net is loaded before we ask for QR codes, to avoid delays
         // between the voice and being ready to scan.
-        self.start_ux(orb)?;
+        self.start_ux(orb);
         Ok(BrokerFlow::Continue)
     }
 
@@ -84,7 +88,9 @@ impl<S: Schema> OrbPlan for Plan<S> {
             orb.main_mcu.rx_mut().next_broadcast().poll_unpin(cx)?
         {
             if let Some(qr_code) = orb.qr_code.enabled() {
-                qr_code.send_now(port::Input::new(qr_code::Input::Als(als.ambient_light_lux)))?;
+                qr_code
+                    .tx
+                    .send_now(port::Input::new(qr_code::Input::Als(als.ambient_light_lux)))?;
             }
         }
 
@@ -95,11 +101,6 @@ impl<S: Schema> OrbPlan for Plan<S> {
                 return Ok(BrokerFlow::Break);
             }
         }
-        if let Some(reminder) = &mut self.reminder {
-            while reminder.poll_next_unpin(cx).is_ready() {
-                orb.sound.build(S::sound())?.push()?;
-            }
-        }
         Ok(BrokerFlow::Continue)
     }
 }
@@ -107,34 +108,65 @@ impl<S: Schema> OrbPlan for Plan<S> {
 impl<S: Schema> Plan<S> {
     /// Creates a new QR-code scanning plan.
     #[must_use]
-    pub fn new(timeout: Option<Duration>) -> Self {
+    pub fn new(timeout: Option<Duration>, reduced_fps: bool) -> Self {
         let timeout = timeout.map(|timeout| Box::pin(time::sleep(timeout)));
-        Self { reminder: None, timeout, qr_code: Err(ScanError::Invalid), ux_started: false }
+        let fps = if reduced_fps { RGB_FPS_REDUCED } else { RGB_FPS };
+        Self {
+            reminder: None,
+            timeout,
+            fps,
+            qr_code: Err(ScanError::Invalid),
+            ux_started: false,
+            self_serve: false,
+        }
     }
 
     /// Runs the QR-code scanning plan.
-    pub async fn run(mut self, orb: &mut Orb) -> Result<Result<S, ScanError>> {
-        orb.start_rgb_camera().await?;
-        orb.enable_qr_code()?;
-        orb.set_fisheye(RGB_DEFAULT_WIDTH, RGB_DEFAULT_HEIGHT, true).await?;
+    pub async fn run(mut self, orb: &mut Orb) -> Result<Result<(S, String), ScanError>> {
+        self.run_pre(orb).await?;
         orb.run(&mut self).await?;
-        orb.led.qr_scan_completed(S::led());
-        let qr_code = self.qr_code;
-        orb.disable_qr_code();
-        orb.stop_rgb_camera().await?;
+        let qr_code = self.take_qr_code();
+        self.run_post(orb).await?;
         Ok(qr_code)
     }
 
-    fn start_ux(&mut self, orb: &mut Orb) -> Result<()> {
+    pub(crate) async fn run_pre(&mut self, orb: &mut Orb) -> Result<()> {
+        orb.start_rgb_camera(self.fps).await?;
+        orb.enable_qr_code().await?;
+        orb.set_fisheye(RGB_DEFAULT_WIDTH, RGB_DEFAULT_HEIGHT, true).await?;
+        self.self_serve = orb.config.lock().await.self_serve;
+        Ok(())
+    }
+
+    pub(crate) async fn run_post(&mut self, orb: &mut Orb) -> Result<()> {
+        orb.disable_qr_code();
+        orb.stop_rgb_camera().await?;
+        Ok(())
+    }
+
+    pub(crate) fn take_qr_code(&mut self) -> Result<(S, String), ScanError> {
+        replace(&mut self.qr_code, Err(ScanError::Invalid))
+    }
+
+    fn start_ux(&mut self, orb: &mut Orb) {
         if !self.ux_started {
-            orb.led.qr_scan_start(S::led());
-            orb.sound.build(S::sound())?.push()?;
+            // differentiated ux for operator qr code depending on self-serve mode
+            let schema = match S::ui() {
+                QrScanSchema::Operator => {
+                    if self.self_serve {
+                        QrScanSchema::OperatorSelfServe
+                    } else {
+                        QrScanSchema::Operator
+                    }
+                }
+                x => x,
+            };
+            orb.ui.qr_scan_start(schema);
             self.ux_started = true;
             let mut reminder = time::interval(QR_SCAN_REMINDER);
             reminder.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
             reminder.reset();
             self.reminder = Some(IntervalStream::new(reminder));
         }
-        Ok(())
     }
 }

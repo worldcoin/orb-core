@@ -1,10 +1,11 @@
 //! A common frame trait.
 
+pub mod depth;
 pub mod ir;
 pub mod rgb;
 pub mod thermal;
 
-use super::{Agent, AgentProcess, AgentTask, AgentThread};
+use orb_wld_data_id::{ImageId, SignupId};
 use png::EncodingError;
 use serde::{Deserialize, Serialize};
 use std::{io::Write, time::Duration};
@@ -31,6 +32,9 @@ pub trait Frame: Clone {
         resolution: FrameResolution,
     ) -> Result<(), EncodingError>;
 
+    /// Returns a byte slice of the frame data.
+    fn as_bytes(&self) -> &[u8];
+
     /// Returns the frame timestamp.
     fn timestamp(&self) -> Duration;
 
@@ -39,6 +43,16 @@ pub trait Frame: Clone {
 
     /// Returns the sensor frame height.
     fn height(&self) -> u32;
+
+    /// Returns a image id for the frame.
+    fn image_id(&self, signup_id: &SignupId) -> ImageId {
+        let mut hasher = crc32fast::Hasher::new();
+        hasher.update(self.as_bytes());
+        hasher.update(&self.timestamp().as_nanos().to_le_bytes());
+        hasher.update(&self.width().to_le_bytes());
+        hasher.update(&self.height().to_le_bytes());
+        ImageId::new(signup_id, hasher.finalize())
+    }
 }
 
 /// Camera State.

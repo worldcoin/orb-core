@@ -21,6 +21,15 @@ pub struct Frame {
     height: usize,
 }
 
+/// Rotation method for thermal camera frame
+#[derive(Clone)]
+pub enum Rotation {
+    /// Rotate the captured frame clockwise.
+    Clockwise,
+    /// Rotate the captured frame counter-clockwise.j
+    CounterClockwise,
+}
+
 impl Deref for Frame {
     type Target = [u8];
 
@@ -49,7 +58,10 @@ impl Frame {
     /// # Safety
     ///
     /// `frame` must be valid for the lifetime of the function.
-    pub unsafe fn obtain(frame: *mut seekcamera_frame_t) -> Result<Self, Error> {
+    pub unsafe fn obtain(
+        frame: *mut seekcamera_frame_t,
+        rotation: &Rotation,
+    ) -> Result<Self, Error> {
         unsafe {
             let mut frame_ptr = ptr::null_mut();
             result_from(seekcamera_frame_get_frame_by_format(
@@ -61,7 +73,14 @@ impl Frame {
             let width = seekframe_get_width(frame_ptr);
             let height = seekframe_get_height(frame_ptr);
             let mut rotated = vec![0; width * height];
-            copy_rotated(data.cast(), rotated.as_mut_ptr(), width, height);
+            match rotation {
+                Rotation::Clockwise => {
+                    copy_rotated_cw(data.cast(), rotated.as_mut_ptr(), width, height);
+                }
+                Rotation::CounterClockwise => {
+                    copy_rotated_ccw(data.cast(), rotated.as_mut_ptr(), width, height);
+                }
+            }
             Ok(Self {
                 data: rotated,
                 timestamp: SystemTime::UNIX_EPOCH.elapsed().unwrap_or(Duration::MAX),
@@ -75,6 +94,12 @@ impl Frame {
     #[must_use]
     pub fn new(data: Vec<u8>, timestamp: Duration, width: usize, height: usize) -> Self {
         Self { data, timestamp, width, height }
+    }
+
+    /// Returns the frame data.
+    #[must_use]
+    pub fn data(&self) -> &[u8] {
+        &self.data
     }
 
     /// Returns the frame timestamp.
@@ -96,13 +121,27 @@ impl Frame {
     }
 }
 
-fn copy_rotated(mut src: *const u8, dst: *mut u8, width: usize, height: usize) {
+fn copy_rotated_cw(mut src: *const u8, dst: *mut u8, width: usize, height: usize) {
     unsafe {
         for x in 0..height {
             let mut dst_row = dst.add(height - 1 - x);
             for _ in 0..width {
                 *dst_row = *src;
                 dst_row = dst_row.add(height);
+                src = src.add(1);
+            }
+        }
+    }
+}
+
+fn copy_rotated_ccw(mut src: *const u8, dst: *mut u8, width: usize, height: usize) {
+    unsafe {
+        let dst_end = dst.add(width * height);
+        for x in 0..height {
+            let mut dst_row = dst_end.sub(height - x);
+            for _ in 0..width {
+                *dst_row = *src;
+                dst_row = dst_row.sub(height);
                 src = src.add(1);
             }
         }

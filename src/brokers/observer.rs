@@ -1,45 +1,52 @@
 #[cfg(feature = "stage")]
-use std::process::Command;
-use std::{
-    collections::VecDeque,
-    pin::Pin,
-    sync::Arc,
-    task::{Context, Poll},
-    time::Instant,
+use crate::process::Command;
+use crate::{
+    agents::{internal_temperature, thermal},
+    backend::status,
+    config::Config,
+    consts::{
+        BATTERY_VOLTAGE_SHUTDOWN_IDLE_THRESHOLD_MV, BATTERY_VOLTAGE_SHUTDOWN_SIGNUP_THRESHOLD_MV,
+        BUTTON_DOUBLE_PRESS_DEAD_TIME, BUTTON_DOUBLE_PRESS_DURATION, BUTTON_LONG_PRESS_DURATION,
+        BUTTON_TRIPLE_PRESS_DURATION, CONFIG_UPDATE_INTERVAL, DEFAULT_MAX_FAN_SPEED,
+        GRACEFUL_SHUTDOWN_MAX_DELAY_SECONDS, SHUTDOWN_SOUND_DURATION, STATUS_UPDATE_INTERVAL,
+    },
+    dbus::SupervisorProxy,
+    dd_gauge, dd_incr,
+    ext::{broadcast::ReceiverExt as _, mpsc::SenderExt as _},
+    identification::{GIT_VERSION, ORB_OS_VERSION},
+    mcu::{self, main::Version, Mcu},
+    monitor, ssd, ui,
 };
-
-use eyre::{eyre, Result};
+use agentwire::{agent, port, Broker, BrokerFlow};
+use eyre::{bail, eyre, Error, Result, WrapErr};
 use futures::{
     future::{Fuse, FusedFuture},
     prelude::*,
 };
 #[cfg(feature = "stage")]
 use local_ip_address::local_ip;
+use nix::unistd::sync;
 use orb_messages;
-use tokio::{sync::Mutex, task, task::JoinHandle, time};
+use std::{
+    collections::VecDeque,
+    convert::Infallible,
+    pin::Pin,
+    process,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    task::{Context, Poll},
+    time::{Duration, Instant},
+};
+use tokio::{
+    sync::{mpsc, Mutex},
+    task::{self, JoinHandle},
+    time::{self, sleep},
+};
 use tokio_stream::wrappers::IntervalStream;
 
-use orb_macros::Broker;
-
-use crate::{
-    agents::{internal_temperature, thermal},
-    backend::status,
-    config::Config,
-    consts::{
-        BUTTON_DOUBLE_PRESS_DEAD_TIME, BUTTON_DOUBLE_PRESS_DURATION, BUTTON_LONG_PRESS_DURATION,
-        BUTTON_TRIPLE_PRESS_DURATION, CONFIG_UPDATE_INTERVAL, DEFAULT_MAX_FAN_SPEED,
-        STATUS_UPDATE_INTERVAL,
-    },
-    ext::{broadcast::ReceiverExt as _, mpsc::SenderExt},
-    identification::{CURRENT_RELEASE, GIT_VERSION},
-    led,
-    logger::{LogOnError, DATADOG, NO_TAGS},
-    mcu,
-    mcu::{main::Version, Mcu},
-    monitor, port, sound,
-};
-
-use super::{AgentCell, BrokerFlow};
+const SSD_HEALTH_CHECK_INTERVAL: Duration = Duration::from_secs(10);
 
 /// Abstract observer plan.
 #[allow(missing_docs)]
@@ -162,11 +169,11 @@ impl Plan for DefaultPlan {
             let future = async move {
                 match status::request(&request).await {
                     Ok(()) => {
-                        DATADOG.incr("orb.main.count.http.status_update.success", NO_TAGS).or_log();
+                        dd_incr!("main.count.http.status_update.success");
                         tracing::trace!("Status request sent");
                     }
                     Err(err) => {
-                        DATADOG.incr("orb.main.count.http.status_update.error", NO_TAGS).or_log();
+                        dd_incr!("main.count.http.status_update.error");
                         tracing::error!("Status request failed: {err:?}");
                     }
                 }
@@ -185,16 +192,11 @@ impl Plan for DefaultPlan {
                 None => {}
             }
             let config = Arc::clone(&observer.config);
-            let sound = observer.sound.clone();
+            let ui = observer.ui.clone();
             observer.config_update = Some(tokio::spawn(async move {
-                let old_lang = config.lock().await.language().clone();
                 if let Ok(new_config) = Config::download().await {
-                    let new_lang = new_config.language().clone();
                     *config.lock().await = new_config;
-                    if old_lang != new_lang {
-                        let sound_files_fut = sound.load_sound_files(new_lang.as_deref(), true);
-                        sound_files_fut.await?;
-                    }
+                    config.lock().await.propagate_to_ui(ui.as_ref());
                 }
                 Ok(())
             }));
@@ -204,27 +206,30 @@ impl Plan for DefaultPlan {
 }
 
 impl DefaultPlan {
-    /// Runs the default plan of the observer in the background.
-    pub fn spawn(mut self, mut observer: Observer) -> Result<JoinHandle<()>> {
+    /// Runs the default plan of the observer.
+    pub async fn run(mut self, mut observer: Observer) -> Result<()> {
         observer.enable_internal_temperature()?;
         observer.enable_thermal()?;
-        Ok(task::spawn(async move {
-            observer.run(&mut self).await.expect("observer task failure");
-        }))
+        observer.run(&mut self).await.wrap_err("observer")?;
+        // The observer broker exists normally only to request a shutdown.
+        // It can't perform a shutdown on its own, because it doesn't have
+        // access to the async context.
+        observer.shutdown().await.wrap_err("shutdown")?;
+        Ok(())
     }
 }
 
 /// System broker. Runs parallel background tasks.
 #[allow(missing_docs)]
 #[derive(Broker)]
+#[broker(plan = Plan, error = Error, poll_extra)]
 pub struct Observer {
-    #[agent(task)]
-    pub internal_temperature: AgentCell<internal_temperature::Sensor>,
-    #[agent(task)]
-    pub thermal: AgentCell<thermal::Agent>,
+    #[agent(task, init)]
+    pub internal_temperature: agent::Cell<internal_temperature::Sensor>,
+    #[agent(task, init)]
+    pub thermal: agent::Cell<thermal::Agent>,
     config: Arc<Mutex<Config>>,
-    sound: Box<dyn sound::Player>,
-    led: Box<dyn led::Engine>,
+    ui: Box<dyn ui::Engine>,
     main_mcu: Box<dyn Mcu<mcu::Main>>,
     net_monitor: Box<dyn monitor::net::Monitor>,
     button_long_press_timer: Fuse<Pin<Box<time::Sleep>>>,
@@ -235,37 +240,41 @@ pub struct Observer {
     status_update: Fuse<StatusUpdate>,
     status_update_interval: IntervalStream,
     status_request: status::Request,
+    ssd_rx: mpsc::UnboundedReceiver<ssd::Stats>,
     log_line: String,
     last_fan_max_speed: f32,
     battery_is_not_charging_counter: u32,
     network_unblocked: bool,
     battery_tags: Vec<String>,
+    signup_flag: Arc<AtomicBool>,
 }
 
 /// [`Observer`] builder.
 #[derive(Default)]
 pub struct Builder {
     config: Option<Arc<Mutex<Config>>>,
-    sound: Option<Box<dyn sound::Player>>,
-    led: Option<Box<dyn led::Engine>>,
+    ui: Option<Box<dyn ui::Engine>>,
     main_mcu: Option<Box<dyn Mcu<mcu::Main>>>,
     net_monitor: Option<Box<dyn monitor::net::Monitor>>,
+    signup_flag: Option<Arc<AtomicBool>>,
 }
 
 type StatusUpdate = Pin<Box<dyn Future<Output = Result<()>> + Send>>;
 
 impl Builder {
     /// Builds a new [`Observer`].
+    #[must_use]
     pub fn build(self) -> Observer {
-        let Self { config, sound, led, main_mcu, net_monitor } = self;
+        let Self { config, ui: led, main_mcu, net_monitor, signup_flag } = self;
+        let (ssd_tx, ssd_rx) = mpsc::unbounded_channel();
+        task::spawn(ssd_health_check(ssd_tx));
         let mut status_update_interval = time::interval(STATUS_UPDATE_INTERVAL);
         status_update_interval.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
         let mut status_request = status::Request::default();
-        status_request.version.current_release = CURRENT_RELEASE.clone();
+        status_request.version.current_release.clone_from(&ORB_OS_VERSION);
         new_observer!(
             config: config.unwrap_or_default(),
-            sound: sound.unwrap_or_else(|| Box::new(sound::Fake)),
-            led: led.unwrap_or_else(|| Box::new(led::Fake)),
+            ui: led.unwrap_or_else(|| Box::new(ui::Fake)),
             main_mcu: main_mcu.unwrap_or_else(|| Box::<mcu::main::Fake>::default()),
             net_monitor: net_monitor.unwrap_or_else(|| Box::new(monitor::net::Fake)),
             button_long_press_timer: Fuse::terminated(),
@@ -276,11 +285,13 @@ impl Builder {
             status_update: Fuse::terminated(),
             status_update_interval: IntervalStream::new(status_update_interval),
             status_request,
+            ssd_rx,
             log_line: String::new(),
             last_fan_max_speed: DEFAULT_MAX_FAN_SPEED,
             battery_is_not_charging_counter: 0,
             network_unblocked: false,
             battery_tags: Vec::new(),
+            signup_flag: signup_flag.unwrap_or_default(),
         )
     }
 
@@ -291,17 +302,10 @@ impl Builder {
         self
     }
 
-    /// Sets the sound player.
-    #[must_use]
-    pub fn sound(mut self, sound: Box<dyn sound::Player>) -> Self {
-        self.sound = Some(sound);
-        self
-    }
-
     /// Sets the LED engine.
     #[must_use]
-    pub fn led(mut self, led: Box<dyn led::Engine>) -> Self {
-        self.led = Some(led);
+    pub fn ui(mut self, ui: Box<dyn ui::Engine>) -> Self {
+        self.ui = Some(ui);
         self
     }
 
@@ -318,6 +322,13 @@ impl Builder {
         self.net_monitor = Some(net_monitor);
         self
     }
+
+    /// Sets the biometric capture state atomic flag.
+    #[must_use]
+    pub fn signup_flag(mut self, signup_flag: Arc<AtomicBool>) -> Self {
+        self.signup_flag = Some(signup_flag);
+        self
+    }
 }
 
 impl Observer {
@@ -325,6 +336,37 @@ impl Observer {
     #[must_use]
     pub fn builder() -> Builder {
         Builder::default()
+    }
+
+    /// Shuts down the orb.
+    pub async fn shutdown(&mut self) -> Result<Infallible> {
+        dd_incr!("main.count.global.shutting_down");
+        tracing::info!("Shutting down the Orb");
+        // save latest config to disk
+        tracing::info!("Starting to write config to disk");
+        self.config.lock().await.store().await?;
+        sync(); // sync filesystem
+        tracing::info!("Config written to disk");
+
+        // pause to avoid killing worldcoin-ui before the shutdown sound is done playing
+        sleep(SHUTDOWN_SOUND_DURATION).await;
+
+        // shutdown comes from the MCU in last resort
+        self.main_mcu.send(mcu::main::Input::Shutdown(GRACEFUL_SHUTDOWN_MAX_DELAY_SECONDS)).await?;
+        let connection = zbus::Connection::session()
+            .await
+            .wrap_err("failed establishing a `session` dbus connection")?;
+        let proxy =
+            SupervisorProxy::new(&connection).await.wrap_err("failed creating supervisor proxy")?;
+        tracing::info!(
+            "scheduling poweroff in 0ms by calling \
+             org.worldcoin.OrbSupervisor1.Manager.ScheduleShutdown"
+        );
+        proxy
+            .schedule_shutdown("poweroff", 0)
+            .await
+            .wrap_err("failed to schedule poweroff to supervisor proxy")?;
+        process::exit(0);
     }
 
     #[allow(clippy::unused_self)]
@@ -347,16 +389,22 @@ impl Observer {
         let cpu: i16 = output.value.cpu;
         let gpu: i16 = output.value.gpu;
         let ssd: i16 = output.value.ssd;
-        DATADOG.gauge("orb.main.gauge.system.temperature", cpu.to_string(), ["type:cpu"])?;
-        DATADOG.gauge("orb.main.gauge.system.temperature", gpu.to_string(), ["type:gpu"])?;
-        DATADOG.gauge("orb.main.gauge.system.temperature", ssd.to_string(), ["type:ssd"])?;
+        dd_gauge!("main.gauge.system.temperature", cpu.to_string(), "type:cpu");
+        dd_gauge!("main.gauge.system.temperature", gpu.to_string(), "type:gpu");
+        dd_gauge!("main.gauge.system.temperature", ssd.to_string(), "type:ssd");
+        if let Some(wifi) = output.value.wifi {
+            dd_gauge!("main.gauge.system.temperature", wifi.to_string(), "type:wifi");
+        }
         plan.handle_internal_temperature(cpu, gpu, ssd)?;
         let thermal_agent = self.thermal.enabled().expect("thermal agent is not enabled");
-        thermal_agent.send_now(port::Input::new(thermal::Input::JetsonCpu(cpu)))?;
-        thermal_agent.send_now(port::Input::new(thermal::Input::JetsonGpu(gpu)))?;
+        thermal_agent.tx.send_now(port::Input::new(thermal::Input::JetsonCpu(cpu)))?;
+        thermal_agent.tx.send_now(port::Input::new(thermal::Input::JetsonGpu(gpu)))?;
         self.status_request.temperature.cpu = f64::from(cpu);
         self.status_request.temperature.gpu = f64::from(gpu);
         self.status_request.temperature.ssd = f64::from(ssd);
+        if let Some(wifi) = output.value.wifi {
+            self.status_request.temperature.wifi = f64::from(wifi);
+        }
         Ok(BrokerFlow::Continue)
     }
 
@@ -402,18 +450,27 @@ impl Observer {
             self.handle_net_monitor(report.ok_or_else(|| eyre!("network monitor exited"))?);
         }
         while let Poll::Ready(output) = self.main_mcu.rx_mut().next_broadcast().poll_unpin(cx) {
-            self.handle_mcu(plan, output?)?;
+            if matches!(self.handle_mcu(plan, output?)?, BrokerFlow::Break) {
+                return Ok(Some(Poll::Ready(())));
+            }
         }
         if let Poll::Ready(()) = self.button_long_press_timer.poll_unpin(cx) {
             tracing::debug!("Button long press");
             tracing::info!("Shutdown requested by the user");
-            self.led.shutdown(true);
+            self.ui.shutdown(true);
             return Ok(Some(Poll::Ready(())));
         }
         if let Poll::Ready(()) = self.button_double_press_timer.poll_unpin(cx) {
             tracing::debug!("Button double press");
             self.button_press_sequence.clear();
             handle_double_press(self);
+        }
+        while let Poll::Ready(report) = self.ssd_rx.poll_recv(cx) {
+            if let Some(report) = report {
+                self.handle_ssd_health_check(&report);
+            } else {
+                bail!("SSD health check failed");
+            }
         }
         if self.network_unblocked {
             while self.config_update_interval.next().poll_unpin(cx).is_ready() {
@@ -429,7 +486,7 @@ impl Observer {
 
     // Handles messages from the main MCU.
     #[allow(clippy::too_many_lines)]
-    fn handle_mcu(&mut self, plan: &mut dyn Plan, output: mcu::main::Output) -> Result<()> {
+    fn handle_mcu(&mut self, plan: &mut dyn Plan, output: mcu::main::Output) -> Result<BrokerFlow> {
         match output {
             mcu::main::Output::SuccessAck(input) => {
                 log_mcu_success_ack(&input);
@@ -478,46 +535,54 @@ impl Observer {
             }
             mcu::main::Output::BatteryCapacity(capacity) => {
                 tracing::trace!("Battery capacity: {}%", capacity.percentage);
-                DATADOG
-                    .gauge(
-                        "orb.main.gauge.system.battery",
-                        capacity.percentage.to_string(),
-                        NO_TAGS,
-                    )
-                    .or_log();
+                dd_gauge!("main.gauge.system.battery", capacity.percentage.to_string());
                 self.status_request.battery.level = f64::from(capacity.percentage);
-                self.led.battery_capacity(capacity.percentage);
+                self.ui.battery_capacity(capacity.percentage);
                 plan.handle_mcu_battery_capacity(capacity)?;
             }
             mcu::main::Output::BatteryVoltage(battery_voltage) => {
-                DATADOG
-                    .gauge(
-                        "orb.main.gauge.system.voltage",
-                        battery_voltage.battery_cell1_mv.to_string(),
-                        ["type:cell1"],
-                    )
-                    .or_log();
-                DATADOG
-                    .gauge(
-                        "orb.main.gauge.system.voltage",
-                        battery_voltage.battery_cell2_mv.to_string(),
-                        ["type:cell2"],
-                    )
-                    .or_log();
-                DATADOG
-                    .gauge(
-                        "orb.main.gauge.system.voltage",
-                        battery_voltage.battery_cell3_mv.to_string(),
-                        ["type:cell3"],
-                    )
-                    .or_log();
-                DATADOG
-                    .gauge(
-                        "orb.main.gauge.system.voltage",
-                        battery_voltage.battery_cell4_mv.to_string(),
-                        ["type:cell4"],
-                    )
-                    .or_log();
+                dd_gauge!(
+                    "main.gauge.system.voltage",
+                    battery_voltage.battery_cell1_mv.to_string(),
+                    "type:cell1"
+                );
+                dd_gauge!(
+                    "main.gauge.system.voltage",
+                    battery_voltage.battery_cell2_mv.to_string(),
+                    "type:cell2"
+                );
+                dd_gauge!(
+                    "main.gauge.system.voltage",
+                    battery_voltage.battery_cell3_mv.to_string(),
+                    "type:cell3"
+                );
+                dd_gauge!(
+                    "main.gauge.system.voltage",
+                    battery_voltage.battery_cell4_mv.to_string(),
+                    "type:cell4"
+                );
+                let battery_voltage_sum_mv = battery_voltage.battery_cell1_mv
+                    + battery_voltage.battery_cell2_mv
+                    + battery_voltage.battery_cell3_mv
+                    + battery_voltage.battery_cell4_mv;
+                if self.signup_flag.load(Ordering::Relaxed) {
+                    if battery_voltage_sum_mv < BATTERY_VOLTAGE_SHUTDOWN_SIGNUP_THRESHOLD_MV {
+                        tracing::info!(
+                            "Shutting down during SIGNUP state because of low battery voltage: {} \
+                             mV",
+                            battery_voltage_sum_mv
+                        );
+                        self.ui.shutdown(false);
+                        return Ok(BrokerFlow::Break);
+                    }
+                } else if battery_voltage_sum_mv < BATTERY_VOLTAGE_SHUTDOWN_IDLE_THRESHOLD_MV {
+                    tracing::info!(
+                        "Shutting down during idle state because of low battery voltage: {} mV",
+                        battery_voltage_sum_mv
+                    );
+                    self.ui.shutdown(false);
+                    return Ok(BrokerFlow::Break);
+                }
                 plan.handle_mcu_battery_voltage(battery_voltage)?;
             }
             mcu::main::Output::BatteryIsCharging(output) => {
@@ -529,18 +594,11 @@ impl Observer {
                 // This prevents a bug where the battery charging status alternates between true and false.
                 let battery_is_charging = self.battery_is_not_charging_counter < 8;
                 if battery_is_charging {
-                    if !self.status_request.battery.is_charging {
-                        // TODO: Improve the sound before uncommenting
-                        // self.sound
-                        //     .build(sound::Type::Melody(Melody::BatteryPlugIn))?
-                        //     .priority(2)
-                        //     .push()?;
-                    }
-                    DATADOG.incr("orb.main.count.system.battery.is_charging", NO_TAGS).or_log();
+                    dd_incr!("main.count.system.battery.is_charging");
                 } else {
-                    DATADOG.incr("orb.main.count.system.battery.is_not_charging", NO_TAGS).or_log();
+                    dd_incr!("main.count.system.battery.is_not_charging");
                 }
-                self.led.battery_is_charging(battery_is_charging);
+                self.ui.battery_is_charging(battery_is_charging);
                 self.status_request.battery.is_charging = battery_is_charging;
             }
             mcu::main::Output::MotorRange(motor_range) => {
@@ -549,28 +607,20 @@ impl Observer {
             }
             mcu::main::Output::FanStatus(status) => {
                 if status.fan_id == orb_messages::mcu_main::fan_status::FanId::Main as i32 {
-                    DATADOG
-                        .gauge(
-                            "orb.main.gauge.system.fan_main_rpm",
-                            status.measured_speed_rpm.to_string(),
-                            NO_TAGS,
-                        )
-                        .or_log();
+                    dd_gauge!(
+                        "main.gauge.system.fan_main_rpm",
+                        status.measured_speed_rpm.to_string()
+                    );
                 } else if status.fan_id == orb_messages::mcu_main::fan_status::FanId::Aux as i32 {
-                    DATADOG
-                        .gauge(
-                            "orb.main.gauge.system.fan_aux_rpm",
-                            status.measured_speed_rpm.to_string(),
-                            NO_TAGS,
-                        )
-                        .or_log();
+                    dd_gauge!(
+                        "main.gauge.system.fan_aux_rpm",
+                        status.measured_speed_rpm.to_string()
+                    );
                 }
                 plan.handle_fan_status(status)?;
             }
             mcu::main::Output::AmbientLight(als) => {
-                DATADOG
-                    .gauge("orb.main.gauge.system.als", als.ambient_light_lux.to_string(), NO_TAGS)
-                    .or_log();
+                dd_gauge!("main.gauge.system.als", als.ambient_light_lux.to_string());
             }
             mcu::main::Output::FatalError(error) => {
                 // convert to enum for clearer representation in Datadog
@@ -610,23 +660,18 @@ impl Observer {
                     _ => Err(()),
                 };
                 if let Ok(reason) = reason_enum {
-                    DATADOG
-                        .incr("orb.main.count.system.mcu_fatal", [format!(
-                            "main_mcu_reason:{reason:?}",
-                        )])
-                        .or_log();
+                    dd_incr!("main.count.system.mcu_fatal", &format!("main_mcu_reason:{reason:?}"));
                 } else {
                     tracing::error!("Unable to parse fatal MCU error");
                 }
             }
             mcu::main::Output::Versions(versions) => {
-                DATADOG
-                    .incr("orb.main.count.global.version", [
-                        format!("main_mcu:{}", versions.primary),
-                        format!("main_mcu_secondary:{}", versions.secondary),
-                        format!("orb_core:{}", *GIT_VERSION),
-                    ])
-                    .or_log();
+                dd_incr!(
+                    "main.count.global.version",
+                    &format!("main_mcu:{}", versions.primary),
+                    &format!("main_mcu_secondary:{}", versions.secondary),
+                    &format!("orb_core:{}", *GIT_VERSION)
+                );
                 plan.handle_mcu_versions(versions)?;
             }
             mcu::main::Output::Gps(message) => {
@@ -644,16 +689,15 @@ impl Observer {
             }
             mcu::main::Output::HardwareDiag(diag) => {
                 let component =
-                    orb_messages::mcu_main::hardware_diagnostic::Source::try_from(diag.source);
+                    orb_messages::mcu_main::hardware_diagnostic::Source::try_from(diag.source).ok();
                 let status =
-                    orb_messages::mcu_main::hardware_diagnostic::Status::try_from(diag.status);
-                if let (Ok(component), Ok(status)) = (component, status) {
-                    DATADOG
-                        .incr("orb.main.count.global.hardware.component_diag", [
-                            format!("type:{:?}", component.as_str_name().to_lowercase()),
-                            format!("status:{:?}", status.as_str_name().to_lowercase()),
-                        ])
-                        .or_log();
+                    orb_messages::mcu_main::hardware_diagnostic::Status::try_from(diag.status).ok();
+                if let (Some(component), Some(status)) = (component, status) {
+                    dd_incr!(
+                        "main.count.global.hardware.component_diag",
+                        &format!("type:{:?}", component.as_str_name().to_lowercase()),
+                        &format!("status:{:?}", status.as_str_name().to_lowercase())
+                    );
                 }
             }
             mcu::main::Output::BatteryInfo(battery_info) => {
@@ -691,8 +735,13 @@ impl Observer {
                     log_battery_info_max_values(&max_values, &self.battery_tags);
                 }
             }
+            mcu::main::Output::BatteryStateOfHealth(state_of_health) => {
+                if !self.battery_tags.is_empty() {
+                    log_battery_state_of_health(&state_of_health, &self.battery_tags);
+                }
+            }
         }
-        Ok(())
+        Ok(BrokerFlow::Continue)
     }
 
     fn handle_gps(
@@ -721,90 +770,71 @@ impl Observer {
 
     fn handle_net_monitor(&mut self, report: monitor::net::Report) {
         tracing::trace!("Network monitor: {report:?}");
-        DATADOG
-            .gauge(
-                "orb.main.gauge.system.connectivity.ping_time",
-                if report.is_no_internet() { String::new() } else { report.lag.to_string() },
-                NO_TAGS,
-            )
-            .or_log();
-        DATADOG
-            .gauge(
-                "orb.main.gauge.system.connectivity.rssi",
-                if report.is_no_wlan() { String::new() } else { report.rssi.to_string() },
-                NO_TAGS,
-            )
-            .or_log();
+        if !report.is_no_internet() {
+            // If internet is available
+            dd_gauge!("main.gauge.system.connectivity.ping_time", report.lag.to_string());
+            dd_gauge!("main.gauge.system.connectivity.rssi", report.rssi.to_string());
+        }
         if report.is_no_internet() {
-            self.led.no_internet();
+            self.ui.no_internet();
         } else if report.is_slow_internet() {
-            self.led.slow_internet();
+            self.ui.slow_internet();
         } else {
-            self.led.good_internet();
+            self.ui.good_internet();
         }
         if report.is_no_wlan() {
-            self.led.no_wlan();
+            self.ui.no_wlan();
         } else if report.is_slow_wlan() {
-            self.led.slow_wlan();
+            self.ui.slow_wlan();
         } else {
-            self.led.good_wlan();
+            self.ui.good_wlan();
         }
         self.status_request.wifi.quality.signal_level = report.rssi;
         self.status_request.wifi.ssid = report.ssid;
+        self.status_request.mac_address = report.mac_address;
+    }
+
+    fn handle_ssd_health_check(&mut self, report: &ssd::Stats) {
+        self.status_request.ssd.space_left =
+            i64::try_from(report.available_space).unwrap_or(i64::MAX);
+        self.status_request.ssd.file_left = report.documents;
+        self.status_request.ssd.signup_left_to_upload = report.signups;
     }
 }
 
 fn log_mcu_success_ack(input: &mcu::main::Input) {
     match input {
         mcu::main::Input::IrLedDuration(ir_led_duration) => {
-            DATADOG
-                .gauge("orb.main.gauge.system.ir_led_duration", ir_led_duration.to_string(), [
-                    "type:general",
-                ])
-                .or_log();
+            dd_gauge!(
+                "main.gauge.system.ir_led_duration",
+                ir_led_duration.to_string(),
+                "type:general"
+            );
         }
         mcu::main::Input::IrLedDuration740nm(ir_led_duration) => {
-            DATADOG
-                .gauge("orb.main.gauge.system.ir_led_duration", ir_led_duration.to_string(), [
-                    "type:740",
-                ])
-                .or_log();
+            dd_gauge!("main.gauge.system.ir_led_duration", ir_led_duration.to_string(), "type:740");
         }
         mcu::main::Input::UserLedBrightness(user_led_brightness) => {
-            DATADOG
-                .gauge(
-                    "orb.main.gauge.system.user_led_brightness",
-                    user_led_brightness.to_string(),
-                    NO_TAGS,
-                )
-                .or_log();
+            dd_gauge!("main.gauge.system.user_led_brightness", user_led_brightness.to_string());
         }
         mcu::main::Input::LiquidLens(current) => {
             current.map(|current| -> Result<()> {
-                DATADOG.gauge("orb.main.gauge.system.focus", current.to_string(), NO_TAGS).or_log();
+                dd_gauge!("main.gauge.system.focus", current.to_string());
                 Ok(())
             });
         }
         mcu::main::Input::FrameRate(frame_rate) => {
-            DATADOG
-                .gauge("orb.main.gauge.system.frame_rate", frame_rate.to_string(), NO_TAGS)
-                .or_log();
+            dd_gauge!("main.gauge.system.frame_rate", frame_rate.to_string());
         }
         mcu::main::Input::Mirror(x, y) => {
-            DATADOG
-                .gauge("orb.main.gauge.mirror.angle", x.to_string(), ["type:horizontal"])
-                .or_log();
-            DATADOG.gauge("orb.main.gauge.mirror.angle", y.to_string(), ["type:vertical"]).or_log();
+            dd_gauge!("main.gauge.mirror.angle", x.to_string(), "type:phi_degrees");
+            dd_gauge!("main.gauge.mirror.angle", y.to_string(), "type:theta_degrees");
         }
         mcu::main::Input::FanSpeed(percentage) => {
-            DATADOG
-                .gauge("orb.main.gauge.system.fan_speed", percentage.to_string(), NO_TAGS)
-                .or_log();
+            dd_gauge!("main.gauge.system.fan_speed", percentage.to_string());
         }
         mcu::main::Input::TofCalibration(calibration) => {
-            DATADOG
-                .gauge("orb.main.gauge.system.tof_calibration", calibration.to_string(), NO_TAGS)
-                .or_log();
+            dd_gauge!("main.gauge.system.tof_calibration", calibration.to_string());
         }
         mcu::main::Input::IrLed(_)
         | mcu::main::Input::MirrorRelative(_, _)
@@ -824,6 +854,8 @@ fn log_mcu_success_ack(input: &mcu::main::Input) {
         | mcu::main::Input::OperatorLeds(_)
         | mcu::main::Input::OperatorLedBrightness(_)
         | mcu::main::Input::OperatorLedPattern(_)
+        | mcu::main::Input::ConeLedPattern(_)
+        | mcu::main::Input::WhiteLedBrightness(_)
         | mcu::main::Input::IrEyeCameraFocusSweepValuesPolynomial(_)
         | mcu::main::Input::PerformIrEyeCameraFocusSweep
         | mcu::main::Input::IrEyeCameraMirrorSweepValuesPolynomial(_)
@@ -849,9 +881,13 @@ fn speak_ip_address() {
         }
 
         tracing::info!("Local IP Address: {}", ip_string);
-        Command::new("espeak").args(espeak_args).arg(ip_string).spawn().ok();
+        Command::new("/usr/bin/espeak").args(espeak_args).arg(ip_string).spawn().ok();
     } else {
-        Command::new("espeak").args(espeak_args).arg("Could not obtain IP address").spawn().ok();
+        Command::new("/usr/bin/espeak")
+            .args(espeak_args)
+            .arg("Could not obtain IP address")
+            .spawn()
+            .ok();
     }
 }
 
@@ -872,7 +908,7 @@ fn handle_mcu_temperature(
                 == orb_messages::mcu_main::temperature::TemperatureSource::MainMcu as i32 =>
         {
             thermal_agent
-                .send_now(port::Input::new(thermal::Input::MainMcu(output.temperature_c)))?;
+                .tx.send_now(port::Input::new(thermal::Input::MainMcu(output.temperature_c)))?;
             observer.status_request.temperature.main_mcu = f64::from(output.temperature_c);
             "main_mcu"
         }
@@ -881,7 +917,7 @@ fn handle_mcu_temperature(
                 == orb_messages::mcu_main::temperature::TemperatureSource::SecurityMcu as i32 =>
         {
             thermal_agent
-                .send_now(port::Input::new(thermal::Input::SecurityMcu(output.temperature_c)))?;
+                .tx.send_now(port::Input::new(thermal::Input::SecurityMcu(output.temperature_c)))?;
             observer.status_request.temperature.security_mcu = f64::from(output.temperature_c);
             "security_mcu"
         }
@@ -890,7 +926,7 @@ fn handle_mcu_temperature(
                 == orb_messages::mcu_main::temperature::TemperatureSource::LiquidLens as i32 =>
         {
             thermal_agent
-                .send_now(port::Input::new(thermal::Input::LiquidLens(output.temperature_c)))?;
+                .tx.send_now(port::Input::new(thermal::Input::LiquidLens(output.temperature_c)))?;
             observer.status_request.temperature.liquid_lens = f64::from(output.temperature_c);
             "liquid_lens"
         }
@@ -899,16 +935,15 @@ fn handle_mcu_temperature(
                 == orb_messages::mcu_main::temperature::TemperatureSource::FrontUnit as i32 =>
         {
             thermal_agent
-                .send_now(port::Input::new(thermal::Input::FrontUnit(output.temperature_c)))?;
+                .tx.send_now(port::Input::new(thermal::Input::FrontUnit(output.temperature_c)))?;
             observer.status_request.temperature.front_unit = f64::from(output.temperature_c);
             "front_unit"
         }
         output
             if output.source
-                == orb_messages::mcu_main::temperature::TemperatureSource::MainAccelerometer
-                    as i32 =>
+                == orb_messages::mcu_main::temperature::TemperatureSource::MainAccelerometer as i32 =>
         {
-            thermal_agent.send_now(port::Input::new(thermal::Input::MainAccelerometer(
+            thermal_agent.tx.send_now(port::Input::new(thermal::Input::MainAccelerometer(
                 output.temperature_c,
             )))?;
             observer.status_request.temperature.main_accelerometer =
@@ -920,7 +955,7 @@ fn handle_mcu_temperature(
                 == orb_messages::mcu_main::temperature::TemperatureSource::SecurityAccelerometer
                     as i32 =>
         {
-            thermal_agent.send_now(port::Input::new(thermal::Input::SecurityAccelerometer(
+            thermal_agent.tx.send_now(port::Input::new(thermal::Input::SecurityAccelerometer(
                 output.temperature_c,
             )))?;
             observer.status_request.temperature.security_accelerometer =
@@ -932,7 +967,7 @@ fn handle_mcu_temperature(
                 == orb_messages::mcu_main::temperature::TemperatureSource::BackupBattery as i32 =>
         {
             thermal_agent
-                .send_now(port::Input::new(thermal::Input::BackupBattery(output.temperature_c)))?;
+                .tx.send_now(port::Input::new(thermal::Input::BackupBattery(output.temperature_c)))?;
             observer.status_request.temperature.backup_battery = f64::from(output.temperature_c);
             "backup_battery"
         }
@@ -955,7 +990,7 @@ fn handle_mcu_temperature(
                 == orb_messages::mcu_main::temperature::TemperatureSource::MainBoard as i32 =>
         {
             thermal_agent
-                .send_now(port::Input::new(thermal::Input::Mainboard(output.temperature_c)))?;
+                .tx.send_now(port::Input::new(thermal::Input::Mainboard(output.temperature_c)))?;
             observer.status_request.temperature.mainboard = f64::from(output.temperature_c);
             "mainboard"
         }
@@ -966,16 +1001,194 @@ fn handle_mcu_temperature(
             observer.status_request.temperature.battery_pack = f64::from(output.temperature_c);
             "battery_pack"
         }
+        output
+            if output.source
+                == orb_messages::mcu_main::temperature::TemperatureSource::MainBoardUsbHubBot as i32 =>
+        {
+            observer.status_request.temperature.main_board_usb_hub_bot =
+                f64::from(output.temperature_c);
+            "main_board_usb_hub_bot"
+        }
+        output
+            if output.source
+                == orb_messages::mcu_main::temperature::TemperatureSource::MainBoardUsbHubTop as i32 =>
+        {
+            observer.status_request.temperature.main_board_usb_hub_top =
+                f64::from(output.temperature_c);
+            "main_board_usb_hub_top"
+        }
+        output
+            if output.source
+                == orb_messages::mcu_main::temperature::TemperatureSource::MainBoardSecuritySupply
+                    as i32 =>
+        {
+            observer.status_request.temperature.main_board_security_supply =
+                f64::from(output.temperature_c);
+            "main_board_security_supply"
+        }
+        output
+            if output.source
+                == orb_messages::mcu_main::temperature::TemperatureSource::MainBoardAudioAmplifier
+                    as i32 =>
+        {
+            observer.status_request.temperature.main_board_audio_amplifier =
+                f64::from(output.temperature_c);
+            "main_board_audio_amplifier"
+        }
+        output
+            if output.source
+                == orb_messages::mcu_main::temperature::TemperatureSource::PowerBoardSuperCapCharger
+                    as i32 =>
+        {
+            observer.status_request.temperature.power_board_super_cap_charger =
+                f64::from(output.temperature_c);
+            "power_board_super_cap_charger"
+        }
+        output
+            if output.source
+                == orb_messages::mcu_main::temperature::TemperatureSource::PowerBoardPvccSupply
+                    as i32 =>
+        {
+            observer.status_request.temperature.power_board_pvcc_supply =
+                f64::from(output.temperature_c);
+            "power_board_pvcc_supply"
+        }
+        output
+            if output.source
+                == orb_messages::mcu_main::temperature::TemperatureSource::PowerBoardSuperCapsLeft
+                    as i32 =>
+        {
+            observer.status_request.temperature.power_board_super_caps_left =
+                f64::from(output.temperature_c);
+            "power_board_super_caps_left"
+        }
+        output
+            if output.source
+                == orb_messages::mcu_main::temperature::TemperatureSource::PowerBoardSuperCapsRight
+                    as i32 =>
+        {
+            observer.status_request.temperature.power_board_super_caps_right =
+                f64::from(output.temperature_c);
+            "power_board_super_caps_right"
+        }
+        output
+            if output.source
+                == orb_messages::mcu_main::temperature::TemperatureSource::FrontUnit850730LeftTop
+                    as i32 =>
+        {
+            observer.status_request.temperature.front_unit_850_730_left_top =
+                f64::from(output.temperature_c);
+            "front_unit_850_730_left_top"
+        }
+        output
+            if output.source
+                == orb_messages::mcu_main::temperature::TemperatureSource::FrontUnit850730LeftBottom
+                    as i32 =>
+        {
+            observer.status_request.temperature.front_unit_850_730_left_bottom =
+                f64::from(output.temperature_c);
+            "front_unit_850_730_left_bottom"
+        }
+        output
+            if output.source
+                == orb_messages::mcu_main::temperature::TemperatureSource::FrontUnit850730RightTop
+                    as i32 =>
+        {
+            observer.status_request.temperature.front_unit_850_730_right_top =
+                f64::from(output.temperature_c);
+            "front_unit_850_730_right_top"
+        }
+        output
+            if output.source
+                == orb_messages::mcu_main::temperature::TemperatureSource::FrontUnit850730RightBottom
+                    as i32 =>
+        {
+            observer.status_request.temperature.front_unit_850_730_right_bottom =
+                f64::from(output.temperature_c);
+            "front_unit_850_730_right_bottom"
+        }
+        output
+            if output.source
+                == orb_messages::mcu_main::temperature::TemperatureSource::FrontUnit940LeftTop
+                    as i32 =>
+        {
+            observer.status_request.temperature.front_unit_940_left_top =
+                f64::from(output.temperature_c);
+            "front_unit_940_left_top"
+        }
+        output
+            if output.source
+                == orb_messages::mcu_main::temperature::TemperatureSource::FrontUnit940LeftBottom
+                    as i32 =>
+        {
+            observer.status_request.temperature.front_unit_940_left_bottom =
+                f64::from(output.temperature_c);
+            "front_unit_940_left_bottom"
+        }
+        output
+            if output.source
+                == orb_messages::mcu_main::temperature::TemperatureSource::FrontUnit940RightTop
+                    as i32 =>
+        {
+            observer.status_request.temperature.front_unit_940_right_top =
+                f64::from(output.temperature_c);
+            "front_unit_940_right_top"
+        }
+        output
+            if output.source
+                == orb_messages::mcu_main::temperature::TemperatureSource::FrontUnit940RightBottom
+                    as i32 =>
+        {
+            observer.status_request.temperature.front_unit_940_right_bottom =
+                f64::from(output.temperature_c);
+            "front_unit_940_right_bottom"
+        }
+        output
+            if output.source
+                == orb_messages::mcu_main::temperature::TemperatureSource::FrontUnit940CenterTop
+                    as i32 =>
+        {
+            observer.status_request.temperature.front_unit_940_center_top =
+                f64::from(output.temperature_c);
+            "front_unit_940_center_top"
+        }
+        output
+            if output.source
+                == orb_messages::mcu_main::temperature::TemperatureSource::FrontUnit940CenterBottom
+                    as i32 =>
+        {
+            observer.status_request.temperature.front_unit_940_center_bottom =
+                f64::from(output.temperature_c);
+            "front_unit_940_center_bottom"
+        }
+        output
+            if output.source
+                == orb_messages::mcu_main::temperature::TemperatureSource::FrontUnitWhiteTop as i32 =>
+        {
+            observer.status_request.temperature.front_unit_white_top =
+                f64::from(output.temperature_c);
+            "front_unit_white_top"
+        }
+        output
+            if output.source
+                == orb_messages::mcu_main::temperature::TemperatureSource::FrontUnitShroudRgbTop
+                    as i32 =>
+        {
+            observer.status_request.temperature.front_unit_shroud_rgb_top =
+                f64::from(output.temperature_c);
+            "front_unit_shroud_rgb_top"
+        }
         _ => "undefined_source",
     };
-    DATADOG
-        .gauge("orb.main.gauge.system.temperature", output.temperature_c.to_string(), [format!(
-            "type:{temp_type}"
-        )])
-        .or_log();
+    dd_gauge!(
+        "main.gauge.system.temperature",
+        output.temperature_c.to_string(),
+        &format!("type:{temp_type}")
+    );
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)]
 fn log_mcu_voltage(output: &orb_messages::mcu_main::Voltage) {
     let name = match output {
         output
@@ -1041,26 +1254,122 @@ fn log_mcu_voltage(output: &orb_messages::mcu_main::Voltage) {
         {
             "supply_3v3_ssd"
         }
+        output
+            if output.source
+                == orb_messages::mcu_main::voltage::VoltageSource::Supply3v3Wifi as i32 =>
+        {
+            "supply_3v3_wifi"
+        }
+        output
+            if output.source
+                == orb_messages::mcu_main::voltage::VoltageSource::Supply3v3Lte as i32 =>
+        {
+            "supply_3v3_lte"
+        }
+        output
+            if output.source
+                == orb_messages::mcu_main::voltage::VoltageSource::Supply3v6 as i32 =>
+        {
+            "supply_3v6"
+        }
+        output
+            if output.source
+                == orb_messages::mcu_main::voltage::VoltageSource::Supply1v2 as i32 =>
+        {
+            "supply_1v2"
+        }
+        output
+            if output.source
+                == orb_messages::mcu_main::voltage::VoltageSource::Supply2v8 as i32 =>
+        {
+            "supply_2v8"
+        }
+        output
+            if output.source
+                == orb_messages::mcu_main::voltage::VoltageSource::Supply1v8Sec as i32 =>
+        {
+            "supply_1v8_sec"
+        }
+        output
+            if output.source
+                == orb_messages::mcu_main::voltage::VoltageSource::Supply4v7Sec as i32 =>
+        {
+            "supply_4v7_sec"
+        }
+        output
+            if output.source
+                == orb_messages::mcu_main::voltage::VoltageSource::Supply17vCaps as i32 =>
+        {
+            "supply_17v_caps"
+        }
+        output
+            if output.source
+                == orb_messages::mcu_main::voltage::VoltageSource::SuperCap0 as i32 =>
+        {
+            "super_cap_0"
+        }
+        output
+            if output.source
+                == orb_messages::mcu_main::voltage::VoltageSource::SuperCap1 as i32 =>
+        {
+            "super_cap_1"
+        }
+        output
+            if output.source
+                == orb_messages::mcu_main::voltage::VoltageSource::SuperCap2 as i32 =>
+        {
+            "super_cap_2"
+        }
+        output
+            if output.source
+                == orb_messages::mcu_main::voltage::VoltageSource::SuperCap3 as i32 =>
+        {
+            "super_cap_3"
+        }
+        output
+            if output.source
+                == orb_messages::mcu_main::voltage::VoltageSource::SuperCap4 as i32 =>
+        {
+            "super_cap_4"
+        }
+        output
+            if output.source
+                == orb_messages::mcu_main::voltage::VoltageSource::SuperCap5 as i32 =>
+        {
+            "super_cap_5"
+        }
+        output
+            if output.source
+                == orb_messages::mcu_main::voltage::VoltageSource::SuperCap6 as i32 =>
+        {
+            "super_cap_6"
+        }
+        output
+            if output.source
+                == orb_messages::mcu_main::voltage::VoltageSource::SuperCap7 as i32 =>
+        {
+            "super_cap_7"
+        }
         _ => return,
     };
-    DATADOG
-        .gauge("orb.main.gauge.system.voltage", output.voltage_current_mv.to_string(), [
-            format!("type:{name}"),
-            "aggregation:current".to_string(),
-        ])
-        .or_log();
-    DATADOG
-        .gauge("orb.main.gauge.system.voltage", output.voltage_max_mv.to_string(), [
-            format!("type:{name}"),
-            "aggregation:max".to_string(),
-        ])
-        .or_log();
-    DATADOG
-        .gauge("orb.main.gauge.system.voltage", output.voltage_min_mv.to_string(), [
-            format!("type:{name}"),
-            "aggregation:min".to_string(),
-        ])
-        .or_log();
+    dd_gauge!(
+        "main.gauge.system.voltage",
+        output.voltage_current_mv.to_string(),
+        &format!("type:{name}"),
+        "aggregation:current"
+    );
+    dd_gauge!(
+        "main.gauge.system.voltage",
+        output.voltage_max_mv.to_string(),
+        &format!("type:{name}"),
+        "aggregation:max"
+    );
+    dd_gauge!(
+        "main.gauge.system.voltage",
+        output.voltage_min_mv.to_string(),
+        &format!("type:{name}"),
+        "aggregation:min"
+    );
 }
 
 fn log_mcu_motor_range(output: &orb_messages::mcu_main::MotorRange) {
@@ -1069,23 +1378,39 @@ fn log_mcu_motor_range(output: &orb_messages::mcu_main::MotorRange) {
             if output.which_motor
                 == orb_messages::mcu_main::motor_range::Motor::HorizontalPhi as i32 =>
         {
-            DATADOG
-                .gauge("orb.main.gauge.mirror.range", output.range_microsteps.to_string(), [
-                    "type:horizontal",
-                ])
-                .or_log();
+            dd_gauge!(
+                "main.gauge.mirror.range",
+                output.range_microsteps.to_string(),
+                "type:phi_microsteps"
+            );
         }
         output
             if output.which_motor
                 == orb_messages::mcu_main::motor_range::Motor::VerticalTheta as i32 =>
         {
-            DATADOG
-                .gauge("orb.main.gauge.mirror.range", output.range_microsteps.to_string(), [
-                    "type:vertical",
-                ])
-                .or_log();
+            dd_gauge!(
+                "main.gauge.mirror.range",
+                output.range_microsteps.to_string(),
+                "type:theta_microsteps"
+            );
         }
         _ => {}
+    }
+}
+
+async fn ssd_health_check(ssd_tx: mpsc::UnboundedSender<ssd::Stats>) {
+    loop {
+        match task::spawn_blocking(ssd::stats).await {
+            Ok(Ok(Some(stats))) => {
+                if ssd_tx.send(stats).is_err() {
+                    break;
+                }
+            }
+            Ok(Ok(None)) => {}
+            Ok(Err(err)) => tracing::error!("SSD health check error: {err}"),
+            Err(err) => tracing::error!("SSD health check error: {err}"),
+        }
+        time::sleep(SSD_HEALTH_CHECK_INTERVAL).await;
     }
 }
 
@@ -1108,7 +1433,7 @@ fn log_battery_info(battery_info: &orb_messages::mcu_main::BatteryInfoHwFw) -> V
         let fw_version = Version::from(fw_version);
         tags.push(format!("battery_fw:{fw_version}"));
     }
-    DATADOG.incr("orb.main.count.system.battery_info", tags.as_slice()).or_log();
+    dd_incr!("main.count.system.battery_info"; tags.as_slice());
     tags
 }
 
@@ -1122,7 +1447,7 @@ fn log_battery_reset_reason(
             .as_str_name();
     let mut tags = battery_tags.to_owned();
     tags.push(format!("reset_reason:{reason}"));
-    DATADOG.incr("orb.main.count.system.battery_reset_reason", tags.as_slice()).or_log();
+    dd_incr!("main.count.system.battery_reset_reason"; tags.as_slice());
 }
 
 fn log_battery_diagnostics_common(
@@ -1194,17 +1519,15 @@ fn log_battery_diagnostics_common(
         }
     }
 
-    DATADOG.incr("orb.main.count.system.battery_diagnostic", tags).or_log();
+    dd_incr!("main.count.system.battery_diagnostic"; tags);
 
     let mut tags = battery_tags.to_owned();
     tags.push(String::from("type:current_ma"));
-    DATADOG
-        .gauge(
-            "orb.main.gauge.system.battery_diagnostic",
-            diagnostics.current_ma.to_string(),
-            tags.as_slice(),
-        )
-        .or_log();
+    dd_gauge!(
+        "main.gauge.system.battery_diagnostic",
+        diagnostics.current_ma.to_string();
+        tags.as_slice()
+    );
 }
 
 fn log_battery_diagnostics_safety(
@@ -1230,7 +1553,7 @@ fn log_battery_diagnostics_safety(
     if diagnostics.safety_status_c != 0 {
         tags.push(format!("safety_status_c:{}", diagnostics.safety_status_c));
     }
-    DATADOG.incr("orb.main.count.system.battery_diagnostic_safety", tags.as_slice()).or_log();
+    dd_incr!("main.count.system.battery_diagnostic_safety"; tags.as_slice());
 }
 
 fn log_battery_diagnostics_permanent_fail(
@@ -1263,7 +1586,7 @@ fn log_battery_diagnostics_permanent_fail(
     if diagnostics.permanent_fail_status_d != 0 {
         tags.push(format!("permanent_fail_status_d:{}", diagnostics.permanent_fail_status_d));
     }
-    DATADOG.incr("orb.main.count.system.battery_diagnostic_pf", tags.as_slice()).or_log();
+    dd_incr!("main.count.system.battery_diagnostic_pf"; tags.as_slice());
 }
 
 fn log_battery_info_soc_statistics(
@@ -1289,44 +1612,36 @@ fn log_battery_info_soc_statistics(
         )
         .as_str_name();
     tags.push(format!("soc_state:{soc_state_str}"));
-    DATADOG.incr("orb.main.count.system.battery_info_soc_statistics", tags).or_log();
+    dd_incr!("main.count.system.battery_info_soc_statistics"; &tags);
 
-    tags = battery_tags.to_owned();
+    battery_tags.clone_into(&mut tags);
     tags.push("type:number_of_button_presses".to_string());
-    DATADOG
-        .gauge(
-            "orb.main.gauge.system.battery_info",
-            battery_info.number_of_button_presses.to_string(),
-            tags.as_slice(),
-        )
-        .or_log();
+    dd_gauge!(
+        "main.gauge.system.battery_info",
+        battery_info.number_of_button_presses.to_string();
+        tags.as_slice()
+    );
     tags.pop();
     tags.push("type:number_of_insertions".to_string());
-    DATADOG
-        .gauge(
-            "orb.main.gauge.system.battery_info",
-            battery_info.number_of_insertions.to_string(),
-            tags.as_slice(),
-        )
-        .or_log();
+    dd_gauge!(
+        "main.gauge.system.battery_info",
+        battery_info.number_of_insertions.to_string();
+        tags.as_slice()
+    );
     tags.pop();
     tags.push("type:number_of_charges".to_string());
-    DATADOG
-        .gauge(
-            "orb.main.gauge.system.battery_info",
-            battery_info.number_of_charges.to_string(),
-            tags.as_slice(),
-        )
-        .or_log();
+    dd_gauge!(
+        "main.gauge.system.battery_info",
+        battery_info.number_of_charges.to_string();
+        tags.as_slice()
+    );
     tags.pop();
     tags.push("type:number_of_written_flash_variables".to_string());
-    DATADOG
-        .gauge(
-            "orb.main.gauge.system.battery_info",
-            battery_info.number_of_written_flash_variables.to_string(),
-            tags.as_slice(),
-        )
-        .or_log();
+    dd_gauge!(
+        "main.gauge.system.battery_info",
+        battery_info.number_of_written_flash_variables.to_string();
+        tags.as_slice()
+    );
 }
 
 fn log_battery_info_max_values(
@@ -1335,47 +1650,51 @@ fn log_battery_info_max_values(
 ) {
     let mut tags = battery_tags.to_owned();
     tags.push(String::from("type:maximum_capacity_mah"));
-    DATADOG
-        .gauge(
-            "orb.main.gauge.system.battery_info",
-            battery_info.maximum_capacity_mah.to_string(),
-            tags.as_slice(),
-        )
-        .or_log();
+    dd_gauge!(
+        "main.gauge.system.battery_info",
+        battery_info.maximum_capacity_mah.to_string();
+        tags.as_slice()
+    );
     tags.pop();
     tags.push(String::from("type:maximum_cell_temp_decidegrees"));
-    DATADOG
-        .gauge(
-            "orb.main.gauge.system.battery_info",
-            battery_info.maximum_cell_temp_decidegrees.to_string(),
-            tags.as_slice(),
-        )
-        .or_log();
+    dd_gauge!(
+        "main.gauge.system.battery_info",
+        battery_info.maximum_cell_temp_decidegrees.to_string();
+        tags.as_slice()
+    );
     tags.pop();
     tags.push(String::from("type:maximum_pcb_temp_decidegrees"));
-    DATADOG
-        .gauge(
-            "orb.main.gauge.system.battery_info",
-            battery_info.maximum_pcb_temp_decidegrees.to_string(),
-            tags.as_slice(),
-        )
-        .or_log();
+    dd_gauge!(
+        "main.gauge.system.battery_info",
+        battery_info.maximum_pcb_temp_decidegrees.to_string();
+        tags.as_slice()
+    );
     tags.pop();
     tags.push(String::from("type:maximum_charge_current_ma"));
-    DATADOG
-        .gauge(
-            "orb.main.gauge.system.battery_info",
-            battery_info.maximum_charge_current_ma.to_string(),
-            tags.as_slice(),
-        )
-        .or_log();
+    dd_gauge!(
+        "main.gauge.system.battery_info",
+        battery_info.maximum_charge_current_ma.to_string();
+        tags.as_slice()
+    );
     tags.pop();
     tags.push(String::from("type:maximum_discharge_current_ma"));
-    DATADOG
-        .gauge(
-            "orb.main.gauge.system.battery_info",
-            battery_info.maximum_discharge_current_ma.to_string(),
-            tags.as_slice(),
-        )
-        .or_log();
+    dd_gauge!(
+        "main.gauge.system.battery_info",
+        battery_info.maximum_discharge_current_ma.to_string();
+        tags.as_slice()
+    );
+}
+
+fn log_battery_state_of_health(
+    battery_state_of_health: &orb_messages::mcu_main::BatteryStateOfHealth,
+    battery_tags: &[String],
+) {
+    let mut tags = battery_tags.to_owned();
+    tags.push(String::from("type:state_of_health_percentage"));
+    dd_gauge!(
+        "main.gauge.system.battery_state_of_health",
+        battery_state_of_health.percentage.to_string();
+        tags.as_slice()
+    );
+    tags.pop();
 }

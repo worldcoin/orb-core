@@ -1,6 +1,11 @@
 //! The rust main program running on the orb and responsible for signup and
 //! other main behaviors of the orb.
 //!
+//! # Architecture
+//!
+//! See the [`brokers`] module documentation for the description of the chosen
+//! architecture.
+//!
 //! # Guidelines
 //!
 //! The code should be formatted with Rustfmt using the project-level
@@ -31,43 +36,41 @@ pub mod dbus;
 pub mod debug_report;
 pub mod dsp;
 pub mod ext;
-pub mod fisheye;
 pub mod identification;
-pub mod led;
+pub mod image;
 pub mod logger;
 pub mod mcu;
 pub mod monitor;
 pub mod network;
 pub mod pid;
 pub mod plans;
-pub mod port;
+pub mod process;
 pub mod secure_element;
-pub mod serializable_instant;
 pub mod short_lived_token;
-pub mod sound;
+pub mod ssd;
 pub mod time_series;
 pub mod timestamped;
+pub mod ui;
 pub mod utils;
 pub mod versions_json;
 
-pub(crate) use self::logger::{inst_elapsed, sys_elapsed};
-
+use agents::call_process_agent;
+use agentwire::agent;
 use eyre::Result;
 use futures::prelude::*;
-use std::{
-    process,
-    sync::atomic::{AtomicUsize, Ordering},
-};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// A wrapper for the main function, which runs common initialization routines
 /// and takes a future to execute as the main function.
 #[allow(clippy::missing_panics_doc)]
 pub fn async_main<F: Future<Output = Result<()>>>(f: F) -> Result<()> {
+    std::env::set_var("LD_LIBRARY_PATH", "/usr/lib/aarch64-linux-gnu/gstreamer-1.0");
     std::env::set_var("LD_PRELOAD", "/usr/lib/aarch64-linux-gnu/libGLdispatch.so");
     color_eyre::install()?;
+    gstreamer::init()?;
     std::env::remove_var("LD_LIBRARY_PATH");
     std::env::remove_var("LD_PRELOAD");
-    agents::init_processes();
+    agent::process::init(call_process_agent);
     let future = async {
         let result = f.await;
         match result {
@@ -75,11 +78,11 @@ pub fn async_main<F: Future<Output = Result<()>>>(f: F) -> Result<()> {
                 // If we return from this function, other async tasks in this tokio
                 // runtime will keep running. We are completely done by now, it's
                 // safe to forcefully kill them.
-                process::exit(0);
+                std::process::exit(0);
             }
             Err(err) => {
                 tracing::error!("Fatal error: {err:?}");
-                process::exit(1);
+                std::process::exit(1);
             }
         }
     };

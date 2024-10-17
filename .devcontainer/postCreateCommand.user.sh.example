@@ -1,20 +1,21 @@
-#!/bin/bash
-set -eux
+#!/usr/bin/env bash
+set -Eeux -o pipefail
 
 # Use zsh
 sudo chsh -s $(which zsh) $USER
 
 # install neovim
-nix-env -iA nixpkgs.neovim
-git clone git@github.com:nvim-lua/kickstart.nvim ~/.config/nvim
+nix profile install nixpkgs#neovim
+git clone https://github.com/nvim-lua/kickstart.nvim ~/.config/nvim
 
 # Install zellij
-nix-env -iA nixpkgs.zellij
+nix profile install nixpkgs#zellij
 
 # Install ripgrep
-nix-env -iA nixpkgs.ripgrep
+nix profile install nixpkgs#ripgrep
 
 # Make Starship the prompt
-nix-env -iA nixpkgs.starship
+nix profile install nixpkgs#starship
 echo 'eval "$(starship init zsh)"' >>${HOME}/.zshrc
 echo 'eval "$(starship init bash)"' >>${HOME}/.bashrc
+curl -L -o ~/.config/starship.toml https://raw.githubusercontent.com/worldcoin/orb-software/fc1a9aa1316264bf9331c6506bcd41ae4ee33be9/nix/xdg/starship.toml

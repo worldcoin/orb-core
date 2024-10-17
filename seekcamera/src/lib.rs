@@ -9,7 +9,7 @@ mod frame;
 
 pub use camera::{AttachError, Camera, RecvError};
 pub use error::Error;
-pub use frame::Frame;
+pub use frame::{Frame, Rotation};
 
 use error::result_from;
 use seekcamera_sys::{

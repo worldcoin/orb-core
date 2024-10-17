@@ -1,5 +1,6 @@
 # VENDORED_SEEK_PATH=~/seek-thermal-sdk
-# use flake --override-input seekSdk $VENDORED_SEEK_PATH
+# VENDORED_ROYALE_PATH=~/royale-sdk
+# use flake --override-input seekSdk $VENDORED_SEEK_PATH --override-input royaleSdk $VENDORED_ROYALE_PATH
 use flake
 
 # export CACHIX_AUTH_TOKEN=<TOKEN>

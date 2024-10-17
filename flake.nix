@@ -3,7 +3,8 @@
 
   inputs = {
     utils.url = "github:numtide/flake-utils";
-    nixpkgs.url = "nixpkgs/nixos-23.05";
+    nixpkgs-24_05.url = "github:NixOS/nixpkgs/nixos-24.05";
+    nixpkgs.url = "nixpkgs/nixos-23.11";
     nixpkgs-old = {
       url = "nixpkgs/nixos-20.09";
       flake = false;
@@ -12,46 +13,56 @@
       url = "github:nix-community/fenix";
       inputs.nixpkgs.follows = "nixpkgs";
     };
-
-	# FOSS:
-    #  iris = {
-    #    url = "github:worldcoin/iris/v1.6.1";
-    #    flake = false;
-    #  };
-    # rgb-net = {
-    #   url = "github:worldcoin/rgb-net/v2.0.2";
-    #   flake = false;
-    # };
+    iris = {
+      url = "github:worldcoin/iris/v1.6.1";
+      flake = false;
+    };
+    rgb-net = {
+      url = "github:worldcoin/rgb-net/v2.0.2";
+      flake = false;
+    };
     seekSdk = {
       url = "github:worldcoin/seek-thermal-sdk";
       flake = false;
     };
+    royaleSdk = {
+      url = "github:worldcoin/royale-sdk-worldcoin";
+      flake = false;
+    };
   };
 
-  outputs = { self, utils, nixpkgs, nixpkgs-old, fenix, /* iris, rgb-net, */ seekSdk }:
+  outputs = { self, utils, nixpkgs, nixpkgs-old, fenix, ... } @ inputs:
     utils.lib.eachDefaultSystem (system:
       let
         flavours = {
-          prod = [ ];
-          stage = [ "stage" ];
+          prod = [ "v2_x_x" ];
+          stage = [ "v2_x_x" "stage" ];
+          integration_testing = [ "v2_x_x" "stage" "integration_testing" ];
+          integration_testing_allow_plan_mods = [ "v2_x_x" "stage" "integration_testing" "allow-plan-mods" ];
+          all_flags = [ "v2_x_x" "stage" "integration_testing" "allow-plan-mods" "no-image-encryption" ];
+          internal_data_acquisition = [ "v2_x_x" "stage" "internal-data-acquisition" ];
+          pcp = [ "v2_x_x" "stage" "internal-pcp-export" "internal-pcp-no-encryption" ];
         };
 
         rustChannel = {
-          channel = "1.75";
+          channel = "1.81.0";
           # To find the following hash for future versions, just put an empty
           # string and let Nix fail.
-          sha256 = "SXRtAuO4IqNOQq+nLbrsDFbVk+3aVA8NNpSZsKlVH/8=";
+          sha256 = "VZZnlyP69+Y3crrLHQyJirqlHrTtGTsyiSnZB8jEvVo=";
         };
         rustFmtChannel = {
           channel = "nightly";
-          date = "2023-12-28";
-          sha256 = "4HfRQx49hyuJ8IjBWSty3OXCLOmeaZF5qZAXW6QiQNI=";
+          date = "2024-09-06";
+          sha256 = "UH3aTxjEdeXYn/uojGVTHrJzZRCc3ODd05EDFvHmtKE=";
         };
 
         # Regular native environment.
         pkgs = import nixpkgs {
           inherit system;
-          overlays = [ opencvOverlay ];
+          overlays = [
+            opencvOverlay
+            (import ./nix/overlays/nixpkgs-24_05.nix { inherit inputs; })
+          ];
         };
 
         opencvOverlay = self: super: {
@@ -94,6 +105,7 @@
         ];
         # Common host dependencies.
         hostDeps = [
+          pkgs.nixpkgs-24_05.cargo-deny
           # Nix requires loaders to be wrapped so Nix can edit the ELF RPATH.
           # Unfortunately the pkgs.lld package is the unwrapped version while
           # the wrapped one is described here:
@@ -114,8 +126,20 @@
         ];
         # Host dependencies when compiling natively.
         nativeHostDeps = [
-          # (pkgs.callPackage (import ./nix/python.nix) { inherit iris rgb-net; })
+          (pkgs.callPackage (import ./nix/python.nix) { inherit (inputs) iris rgb-net; })
           pkgs.clang
+        ] ++ livestreamHostDeps;
+        livestreamHostDeps = with nixpkgs.legacyPackages.${system}; [
+          gst_all_1.gst-libav.dev
+          gst_all_1.gst-plugins-bad
+          gst_all_1.gst-plugins-base.dev
+          gst_all_1.gst-plugins-good
+          gst_all_1.gstreamer.dev
+          libGL
+          libxkbcommon
+          xorg.libX11
+          xorg.libXcursor
+          xorg.libXi
         ];
         # Host dependencies when cross-compiling.
         crossHostDeps = if system == "aarch64-linux" then [ oldPkgs.clang ] else [
@@ -165,7 +189,8 @@
         env = {
           RUST_SRC_PATH = "${rustToolchain}/lib/rustlib/src/rust/library";
           PYO3_PYTHON = "${pkgs.python38}/bin/python";
-          SEEK_SDK_PATH = "${seekSdk}/Seek_Thermal_SDK_4.1.0.0";
+          SEEK_SDK_PATH = "${inputs.seekSdk}/Seek_Thermal_SDK_4.1.0.0";
+          ROYALE_SDK_PATH = "${inputs.royaleSdk}/royale-sdk";
         };
 
         # Development tools.
@@ -182,8 +207,21 @@
         rustFmt = (fenix.packages.${system}.toolchainOf rustFmtChannel).rustfmt;
         rustAnalyzer = fenix.packages.${system}.rust-analyzer;
 
-        callCargo = args: (pkgs.callPackage (import ./nix/cargo.nix) ({
+        normalizeManifest = pkgs.callPackage (import ./nix/cargo) {
           inherit rustToolchain;
+          inherit (pkgs) stdenv;
+          name = "normalize-manifest";
+          cargoCommand = "build";
+          cargoArgs = [ "--release" ];
+          cargoRoot = ./nix/cargo/normalize-manifest;
+          flavours = { default = [ ]; };
+          postInstall = ''
+            mkdir -p $out/bin
+            cp target/release/normalize-manifest $out/bin/
+          '';
+        };
+        callCargo = args: (pkgs.callPackage (import ./nix/cargo) ({
+          inherit rustToolchain normalizeManifest;
           cargoRoot = ./.;
           preConfigure = ''touch git_version'';
         } // args));
@@ -207,7 +245,7 @@
             rustFmt
             rustToolchain
             pkgs.gnuplot
-            pkgs.teleport
+            pkgs.teleport_13
             (pkgs.writeShellScriptBin "ci" ''nix/ci.sh "$@"'')
           ] ++ hostDeps ++ extraHostDeps;
         } // env // extraEnv);
@@ -218,6 +256,7 @@
           clippy = callCargoCross {
             name = "clippy";
             cargoCommand = "clippy";
+            cargoArgs = [ "--workspace" ];
             cargoStepTwoArgs = [ "--tests" "-- --deny warnings" ];
             inherit flavours;
           };
@@ -225,6 +264,7 @@
           check_debug_report_version = callCargoNative {
             name = "check_debug_report_version";
             cargoCommand = "build";
+            cargoArgs = [ "--workspace" ];
             cargoStepTwoArgs = [ "--bin debug-report-schema" ];
             flavours = { inherit (flavours) prod; };
             postInstall = ''
@@ -237,13 +277,14 @@
           test = callCargoNative {
             name = "test";
             cargoCommand = "test";
+            cargoArgs = [ "--workspace" ];
             flavours = { inherit (flavours) prod; };
           };
 
           doc = callCargoNative {
             name = "doc";
             cargoCommand = "doc";
-            cargoArgs = [ "--no-deps" ];
+            cargoArgs = [ "--workspace" "--no-deps" ];
             cargoStepTwoArgs = [ "--document-private-items" ];
             flavours = { inherit (flavours) prod; };
             preBuild = ''export RUSTDOCFLAGS="-Dwarnings"'';
@@ -253,11 +294,11 @@
           build = callCargoCross {
             name = "build";
             cargoCommand = "build";
-            cargoArgs = [ "--release" ];
+            cargoArgs = [ "--workspace" "--release" "--all" ];
             cargoStepTwoArgs = [
               ''$([ "$flavour" == "prod" ] || [ "$flavour" == "stage" ] && echo "--config profile.release.lto=true")''
             ];
-            inherit flavours;
+            flavours = { inherit (flavours) prod stage; };
             postBuildFlavour = ''
               mkdir -p $out/$flavour
               fd . target/$CARGO_BUILD_TARGET/release \
@@ -271,18 +312,35 @@
                 --exec patchelf --set-interpreter /lib/ld-linux-aarch64.so.1 '{}'
             '';
           };
+
+          build_livestream_client = callCargoNative {
+            name = "build_livestream_client";
+            cargoCommand = "build";
+            cargoArgs = [ "--package" "livestream-client" "--release" ];
+            flavours = { prod = [ "," ]; };
+            postBuildFlavour = ''
+              mkdir -p $out/livestream-client
+              fd . target/$CARGO_BUILD_TARGET/release \
+                --exact-depth 1 \
+                --type executable \
+                --exec cp '{}' $out/livestream-client/
+            '';
+            postInstall = ''
+              fd . $out/livestream-client/ \
+                --type executable \
+                --exec patchelf --set-interpreter /lib64/ld-linux-x86-64.so.2 '{}'
+            '';
+          };
         };
 
         devShells = rec {
           cross = mkShell oldPkgsCross crossHostDeps (crossEnv // { name = "orb-core-cross"; });
-          native = mkShell pkgs nativeHostDeps (nativeEnv // { name = "orb-core-native"; });
-          livestream = pkgs.mkShell {
-            nativeBuildInputs = with pkgs; [
-              gst_all_1.gst-libav.dev
-              gst_all_1.gst-plugins-base.dev
-              gst_all_1.gstreamer.dev
-            ];
-          };
+          native = mkShell pkgs nativeHostDeps (nativeEnv // {
+            name = "orb-core-native";
+            shellHook = ''
+              export LD_LIBRARY_PATH=/run/opengl-driver/lib/:${pkgs.lib.makeLibraryPath livestreamHostDeps}
+            '';
+          });
           default = cross;
         };
 

@@ -16,7 +16,9 @@ pub struct Request {
     pub wifi: Wifi,
     pub temperature: Temperature,
     pub location: Location,
+    pub ssd: Ssd,
     pub version: OrbVersion,
+    pub mac_address: String,
 }
 
 #[allow(missing_docs)]
@@ -77,6 +79,27 @@ pub struct Temperature {
     pub battery_pack: f64,
     #[serde(rename = "ssd")]
     pub ssd: f64,
+    pub wifi: f64,
+    pub main_board_usb_hub_bot: f64,
+    pub main_board_usb_hub_top: f64,
+    pub main_board_security_supply: f64,
+    pub main_board_audio_amplifier: f64,
+    pub power_board_super_cap_charger: f64,
+    pub power_board_pvcc_supply: f64,
+    pub power_board_super_caps_left: f64,
+    pub power_board_super_caps_right: f64,
+    pub front_unit_850_730_left_top: f64,
+    pub front_unit_850_730_left_bottom: f64,
+    pub front_unit_850_730_right_top: f64,
+    pub front_unit_850_730_right_bottom: f64,
+    pub front_unit_940_left_top: f64,
+    pub front_unit_940_left_bottom: f64,
+    pub front_unit_940_right_top: f64,
+    pub front_unit_940_right_bottom: f64,
+    pub front_unit_940_center_top: f64,
+    pub front_unit_940_center_bottom: f64,
+    pub front_unit_white_top: f64,
+    pub front_unit_shroud_rgb_top: f64,
 }
 
 #[allow(missing_docs)]
@@ -85,6 +108,15 @@ pub struct Temperature {
 pub struct Location {
     pub latitude: f64,
     pub longitude: f64,
+}
+
+#[allow(missing_docs)]
+#[derive(Serialize, Clone, Default, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct Ssd {
+    pub file_left: i64,
+    pub space_left: i64,
+    pub signup_left_to_upload: i64,
 }
 
 #[allow(missing_docs)]

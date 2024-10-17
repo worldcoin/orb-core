@@ -3,26 +3,18 @@
 use crate::{
     brokers::Orb,
     consts::NETWORK_CONNECTION_TIMEOUT,
-    led::QrScanSchema,
     network,
     plans::qr_scan,
-    sound::{Melody, Type, Voice},
+    ui::{QrScanSchema, QrScanUnexpectedReason},
 };
 use eyre::{Error, Result};
 use std::time::{Duration, Instant};
 use tokio::time::sleep;
 
 /// WiFi plan.
-pub struct Plan {}
+pub struct Plan;
 
 impl Plan {
-    /// Creates a new WiFi plan.
-    #[allow(clippy::new_without_default)]
-    #[must_use]
-    pub fn new() -> Self {
-        Self {}
-    }
-
     /// Checks whether connected to a WiFi network, if not connected scan the
     /// hotspot QR code.
     pub async fn ensure_network_connection(&self, orb: &mut Orb) -> Result<()> {
@@ -30,8 +22,7 @@ impl Plan {
         let mut has_requested_qr_code = false;
         let success = |orb: &mut Orb, has_requested_qr_code| {
             if has_requested_qr_code {
-                orb.sound.build(Type::Melody(Melody::QrLoadSuccess))?.push()?;
-                orb.led.qr_scan_success(QrScanSchema::Wifi);
+                orb.ui.network_connection_success();
             }
             tracing::debug!("Network is connected");
             Ok::<(), Error>(())
@@ -54,12 +45,11 @@ impl Plan {
                 | network::Status::InProgress => {
                     tracing::debug!("Network is disconnected, or has no connection to the backend");
                     if has_requested_qr_code {
-                        orb.led.qr_scan_fail(QrScanSchema::Wifi);
+                        orb.ui.qr_scan_fail(QrScanSchema::Wifi);
                     }
                     has_requested_qr_code = true;
-                    match qr_scan::Plan::new(None).run(orb).await? {
-                        Ok(credentials) => {
-                            orb.sound.build(Type::Melody(Melody::QrCodeCapture))?.push()?;
+                    match qr_scan::Plan::new(None, false).run(orb).await? {
+                        Ok((credentials, _)) => {
                             tracing::info!(
                                 "Read WiFi credentials from hotspot QR: {:?}",
                                 credentials
@@ -68,9 +58,10 @@ impl Plan {
                             in_progress_start = Instant::now();
                         }
                         Err(qr_scan::ScanError::Invalid) => {
-                            orb.led.qr_scan_fail(QrScanSchema::Wifi);
-                            orb.sound.build(Type::Melody(Melody::SoundError))?.push()?;
-                            orb.sound.build(Type::Voice(Voice::WrongQrCodeFormat))?.push()?;
+                            orb.ui.qr_scan_unexpected(
+                                QrScanSchema::Wifi,
+                                QrScanUnexpectedReason::WrongFormat,
+                            );
                         }
                         Err(qr_scan::ScanError::Timeout) => {}
                     }

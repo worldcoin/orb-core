@@ -2,9 +2,10 @@ use crate::{
     agents::python::{extract_normalized_iris, extract_normalized_mask},
     utils::RkyvNdarray,
 };
+use ai_interface::PyError;
 use ndarray::Ix2;
-use pyo3::FromPyObject;
-use python_agent_interface::PyError;
+use numpy::PyArray2;
+use pyo3::{FromPyObject, PyAny, PyResult};
 use rkyv::{Archive, Deserialize, Serialize};
 use schemars::JsonSchema;
 use serde::Serialize as SerdeSerialize;
@@ -17,6 +18,7 @@ pub struct PipelineOutput {
 
     pub iris_template: Option<IrisTemplate>,
     pub normalized_image: Option<NormalizedIris>,
+    pub normalized_image_resized: Option<NormalizedIris>,
     pub metadata: Metadata,
 }
 
@@ -56,6 +58,12 @@ impl NormalizedIris {
             .flat_map(|x| [u8::from(*x)])
             .collect()
     }
+
+    /// Serializes normalized image and mask as bytes arrays.
+    #[must_use]
+    pub fn serialized_image_and_mask(&self) -> (Vec<u8>, Vec<u8>) {
+        (self.serialized_image(), self.serialized_mask())
+    }
 }
 
 #[derive(FromPyObject)]
@@ -85,6 +93,7 @@ pub struct Metadata {
     pub occlusion30: Option<f64>,
     pub ellipticity: Option<Ellipticity>,
     pub iris_bbox: Option<BoundingBox>,
+    pub template_property: Option<TemplateProperty>,
 }
 
 #[derive(
@@ -129,4 +138,34 @@ pub struct BoundingBox {
     y_min: f64,
     x_max: f64,
     y_max: f64,
+}
+
+#[derive(
+    FromPyObject, Debug, Clone, Archive, Serialize, Deserialize, SerdeSerialize, JsonSchema,
+)]
+#[pyo3(from_item_all)]
+#[allow(missing_docs)]
+pub struct TemplateProperty {
+    visible_ratio: Option<f64>,
+    lower_visible_ratio: Option<f64>,
+    upper_visible_ratio: Option<f64>,
+    abnormal_mask_ratio: Option<f64>,
+    weighted_abnormal_mask_ratio: Option<f64>,
+    #[pyo3(from_py_with = "extract_maskcode_hist")]
+    #[schemars(with = "Option<Vec<Vec<Vec<u8>>>>")]
+    maskcode_hist: Option<Vec<RkyvNdarray<u8, Ix2>>>,
+}
+
+fn extract_maskcode_hist(obj: &PyAny) -> PyResult<Option<Vec<RkyvNdarray<u8, Ix2>>>> {
+    if obj.is_none() {
+        return Ok(None);
+    }
+
+    let maskcode_hist: Vec<&PyArray2<u8>> = obj.extract()?;
+    Ok(Some(
+        maskcode_hist
+            .into_iter()
+            .map(|py_arr2| RkyvNdarray::from(py_arr2.to_owned_array()))
+            .collect(),
+    ))
 }

@@ -2,11 +2,12 @@
 name = "orb-ir-net"
 version = "0.1.0"
 authors = ["Valentine Valyaeff <valentine.valyaeff@gmail.com>"]
-
 edition.workspace = true
 license.workspace = true
-repository.workspace = true
-rust-version.workspace = true
+publish = false
+
+[features]
+cuda-test = []
 
 [dependencies]
 eyre.workspace = true
@@ -14,8 +15,8 @@ ndarray.workspace = true
 numpy.workspace = true
 pyo3.workspace = true
 
-[dependencies.python-agent-interface]
-path = "../python-agent-interface"
+[dependencies.ai-interface]
+path = "../ai-interface"
 
 [dev-dependencies]
 approx = "0.5.0"
