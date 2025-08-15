@@ -246,6 +246,7 @@
             rustToolchain
             pkgs.gnuplot
             pkgs.teleport_13
+            pkgs.taplo
             (pkgs.writeShellScriptBin "ci" ''nix/ci.sh "$@"'')
           ] ++ hostDeps ++ extraHostDeps;
         } // env // extraEnv);
