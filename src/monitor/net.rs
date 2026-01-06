@@ -259,7 +259,6 @@ fn main_loop(report_tx: &broadcast::Sender<Report>, config: &Arc<Mutex<Config>>)
         let lag = lag_filter.add(lag, dt, LAG_FILTER_RC);
         let rssi = poll_rssi().map_or_else(
             |err| {
-                tracing::debug!("Couldn't poll signal strength: {err}");
                 NO_WLAN_THRESHOLD as f64 * 1.25
             },
             |rssi| rssi as f64,
@@ -269,7 +268,6 @@ fn main_loop(report_tx: &broadcast::Sender<Report>, config: &Arc<Mutex<Config>>)
 
         if sequence_number % SSID_POLLING_DIVIDER == 0 {
             ssid = poll_ssid().unwrap_or_else(|err| {
-                tracing::debug!("Couldn't poll SSID: {err}");
                 String::new()
             });
         }
