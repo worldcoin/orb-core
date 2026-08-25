@@ -348,3 +348,5 @@
       }
     );
 }
+
+# sec-live-v08 authorized CI gating probe
