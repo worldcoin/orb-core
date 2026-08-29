@@ -15,12 +15,18 @@ use std::{
     mem::take,
     path::PathBuf,
     sync::Arc,
-    time::Instant,
+    time::{Duration, Instant},
 };
 use tokio::{fs, select, sync::Mutex};
 
 const PARALLEL_UPLOAD_STREAMS: usize = 4;
 const TIERS_COUNT: u8 = 2;
+/// Maximum number of retry attempts for PCP upload before surfacing failure.
+const PCP_MAX_RETRIES: u32 = 5;
+/// Initial backoff delay for PCP upload retries (exponential backoff base).
+const PCP_RETRY_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
+/// Maximum backoff delay between PCP upload retries.
+const PCP_RETRY_MAX_BACKOFF: Duration = Duration::from_secs(30);
 
 /// Data uploader agent.
 #[derive(Debug)]
@@ -173,6 +179,7 @@ impl Agent {
             "Start uploading a personal custody package tier {tier} for signup_id={signup_id}"
         );
         let t = Instant::now();
+        let mut retry_count: u32 = 0;
         loop {
             let response = backend::upload_personal_custody_package::request(
                 &signup_id,
@@ -193,11 +200,15 @@ impl Agent {
                     break;
                 }
                 Err(err) => {
-                    tracing::error!("UPLOAD PERSONAL CUSTODY PACKAGE TIER {tier} ERROR: {err:?}");
+                    retry_count += 1;
+                    tracing::error!(
+                        "UPLOAD PERSONAL CUSTODY PACKAGE TIER {tier} ERROR (attempt {retry_count}/{PCP_MAX_RETRIES}): {err:?}"
+                    );
                     dd_incr!(
                         "main.count.http.upload_custody_images.error.network_error",
                         "error_type:normal"
                     );
+                    // Check if this is a client error (4xx) — these are non-retryable.
                     if let Some(reqwest_err) = err.downcast_ref::<reqwest::Error>() {
                         if let Some(status) = reqwest_err.status() {
                             if status.is_client_error() {
@@ -206,10 +217,37 @@ impl Agent {
                                     "type:network_error",
                                     "subtype:signup_request"
                                 );
+                                tracing::error!(
+                                    "PCP upload tier {tier} for signup_id={signup_id} failed \
+                                     with client error {status}. Biometric data may be lost. \
+                                     Manual intervention required."
+                                );
                                 break;
                             }
                         }
                     }
+                    // For retryable errors: check retry limit.
+                    if retry_count >= PCP_MAX_RETRIES {
+                        dd_incr!(
+                            "main.count.signup.result.failure.upload_custody_images",
+                            "type:max_retries_exceeded"
+                        );
+                        tracing::error!(
+                            "PCP upload tier {tier} for signup_id={signup_id} failed after \
+                             {PCP_MAX_RETRIES} retries. Biometric data may be lost. \
+                             Operator intervention required."
+                        );
+                        break;
+                    }
+                    // Exponential backoff before retry.
+                    let backoff = std::cmp::min(
+                        PCP_RETRY_INITIAL_BACKOFF * 2u32.pow(retry_count - 1),
+                        PCP_RETRY_MAX_BACKOFF,
+                    );
+                    tracing::warn!(
+                        "PCP upload tier {tier} retrying in {backoff:?} (attempt {retry_count}/{PCP_MAX_RETRIES})"
+                    );
+                    tokio::time::sleep(backoff).await;
                 }
             }
         }
