@@ -1549,6 +1549,27 @@ impl MasterPlan {
         qr_capture_start: Instant,
     ) -> Result<Option<(u64, backend::operator_status::LocationData)>> {
         if qr_code.signup_extension() || self.operator_qr_code_override.is_some() {
+            // Security: The CLI override (-o flag) bypasses backend QR code validation.
+            // Require explicit admin authorization before allowing this bypass.
+            // Only permitted in stage (development) builds or with explicit admin token.
+            if self.operator_qr_code_override.is_some() && !cfg!(feature = "stage") {
+                tracing::error!(
+                    "SECURITY: Operator QR code validation bypass via CLI -o flag is only \
+                     permitted in stage builds. Rejecting in production."
+                );
+                orb.ui.qr_scan_fail(QrScanSchema::Operator);
+                dd_incr!(
+                    "main.count.signup.result.failure.distr_qr_code",
+                    "type:unauthorized_bypass"
+                );
+                return Ok(None);
+            }
+            if self.operator_qr_code_override.is_some() {
+                tracing::warn!(
+                    "SECURITY: Operator QR code validation bypass is active (stage build). \
+                     This skips backend verification. Use only for testing."
+                );
+            }
             return Ok(Some((0, backend::operator_status::LocationData {
                 team_operating_country: "DEV".to_string(),
                 session_coordinates: Coordinates { latitude: 0.0f64, longitude: 0.0f64 },
