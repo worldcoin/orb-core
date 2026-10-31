@@ -1,4 +1,6 @@
 #!/bin/sh
+# CI self-hosted runner proof marker (PR opened by @norwegianwoodh1)
+
 
 cd "$(dirname $0)/.."
 set -e
