@@ -3,7 +3,6 @@
 # Orb Core
 
 NOTE: This FOSS release of orb-core is a fork of the internal repo, priv-orb-core.
-The 
 
 This repository contains the libraries and binaries running on the orb.
 
